@@ -1,71 +1,59 @@
-// A fast, dependency-free Markdown renderer that produces exactly the
-// HTML marked 18.1.3 emits with its default settings (GFM enabled, hard
-// breaks off, pedantic off). Built from the CommonMark 0.31.2 and GFM 0.29
-// rules as marked implements them — where marked disagrees with the spec,
-// marked wins.
+// Hand-built Markdown -> HTML, byte-identical to marked 18.1.3 with
+// its stock settings (GFM on, breaks off, pedantic off, sync).
 //
-// How it works: the document is first cut into block tokens by a line
-// scanner; inline text is parsed afterwards, once link definitions are
-// known, by a single-pass scanner that leaves emphasis delimiters
-// unresolved until a forward-scanning resolver turns them into <em>,
-// <strong> and <del>. Rendering walks the finished token tree.
+// Where marked and the CommonMark/GFM specs disagree, marked is the
+// authority: the point of this file is to match marked, not the spec.
+//
+// Pipeline:
+//   1. `lex` cuts the document into block tokens, line by line, in the
+//      same order marked tries its block rules.
+//   2. Once every link definition is known, each paragraph / heading /
+//      table cell is scanned once (`scanInline`) into a flat node list.
+//      Emphasis delimiters stay unresolved until `resolveDelims` walks
+//      them opener-first and turns them into em / strong / del.
+//   3. `renderBlocks` walks the token tree and emits HTML.
+//
+// Speed comes from cheap guards, not cleverness: plain paragraphs skip
+// the scanner entirely, the hot text loop is a single index scan, and
+// nothing is allocated per case that can be reused per parse.
 
-const HTML_ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
-// ASCII punctuation a backslash may escape.
-const ESCAPABLE = new Set('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'.split(''));
+// Punctuation a backslash can escape (the CommonMark escapable set).
+const ESCAPES = new Set('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'.split(''));
 
-// Tag names that can open a CommonMark type-6 HTML block.
-const BLOCK_TAG_NAMES = new Set(('address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem meta nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead title tr track ul').split(' '));
+// Element names that may open a CommonMark type-6 HTML block.
+const BLOCK_TAGS = new Set(('address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem meta nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead title tr track ul').split(' '));
 
-// Tags whose inline content is treated as raw (no entity decoding).
-const RAW_INLINE_TAGS = new Set(['pre', 'code', 'kbd', 'script']);
+// ---------- tiny character predicates ----------
 
-// ---------- small string helpers ----------
+function hexDigit(c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102); }
+function wordChar(c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95; }
+function digitChar(c) { return c >= 48 && c <= 57; }
+function alphaChar(c) { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
+function spTab(c) { return c === 32 || c === 9; }
 
-// Escape < > " ' and, when `withAmp` is true, &. With `withAmp` false an
-// ampersand that begins something entity-shaped (&word; / &#12; / &#x1f;)
-// is passed through untouched.
-const ESC_WITH_AMP = /[<>"'&]/g;
-const ESC_KEEP_ENTITY = /[<>"']|&(?!(?:#x[0-9a-fA-F]{1,6};|#\d{1,7};|\w+;))/g;
-function escapeHtml(s, withAmp) {
-  return s.replace(withAmp ? ESC_WITH_AMP : ESC_KEEP_ENTITY, (c) =>
-    c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : c === "'" ? '&#39;' : '&amp;');
-}
-
-// Does s[i] start something that looks like an entity reference?
-function looksLikeEntity(s, i) {
-  let j = i + 1;
-  if (s[j] === '#') {
-    j++;
-    if (s[j] === 'x' || s[j] === 'X') {
-      j++;
-      const start = j;
-      while (j < s.length && isHexDigit(s.charCodeAt(j))) j++;
-      return j > start && j <= start + 6 && s[j] === ';';
-    }
-    const start = j;
-    while (j < s.length && s[j] >= '0' && s[j] <= '9') j++;
-    return j > start && j <= start + 7 && s[j] === ';';
-  }
-  const start = j;
-  while (j < s.length && isWordChar(s.charCodeAt(j))) j++;
-  return j > start && s[j] === ';';
-}
-
-function isHexDigit(c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102); }
-function isWordChar(c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95; }
-function isDigitChar(c) { return c >= 48 && c <= 57; }
-function isAlphaChar(c) { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
-function isSpaceOrTab(c) { return c === 32 || c === 9; }
-function lineIsBlank(line) {
+// A whole line of nothing but spaces and tabs.
+function blankLine(line) {
   for (let i = 0; i < line.length; i++) if (line[i] !== ' ' && line[i] !== '\t') return false;
   return true;
 }
 
-// Decode numeric character references (&#123; and &#x1F;). Named entities
-// are intentionally left alone: marked does not decode them either.
-function decodeNumericEntities(s) {
+// ---------- escaping, entities, hrefs, labels ----------
+
+// Escape < > " ' and, when `amp` is set, &. With `amp` off, an ampersand
+// that starts something shaped like an entity (&name; / &#12; / &#x1f;)
+// is left alone.
+const ESC_AMP = /[<>"'&]/g;
+const ESC_NO_AMP = /[<>"']|&(?!(?:#x[0-9a-fA-F]{1,6};|#\d{1,7};|\w+;))/g;
+function esc(s, amp) {
+  return s.replace(amp ? ESC_AMP : ESC_NO_AMP, (c) =>
+    c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : c === "'" ? '&#39;' : '&amp;');
+}
+
+// Decode numeric references (&#123; and &#x1F;) only. Named entities are
+// deliberately untouched — marked leaves them alone too.
+function decodeNums(s) {
   if (s.indexOf('&#') === -1) return s;
   let out = '', start = 0, i = 0;
   for (;;) {
@@ -75,11 +63,11 @@ function decodeNumericEntities(s) {
     if (s[j] === 'x' || s[j] === 'X') {
       j++;
       const st = j;
-      while (j < s.length && isHexDigit(s.charCodeAt(j))) j++;
+      while (j < s.length && hexDigit(s.charCodeAt(j))) j++;
       if (j > st && j <= st + 6 && s[j] === ';') val = parseInt(s.slice(st, j), 16);
     } else {
       const st = j;
-      while (j < s.length && isDigitChar(s.charCodeAt(j))) j++;
+      while (j < s.length && digitChar(s.charCodeAt(j))) j++;
       if (j > st && j <= st + 7 && s[j] === ';') val = parseInt(s.slice(st, j), 10);
     }
     if (val === -1) { i += 2; continue; }
@@ -91,32 +79,34 @@ function decodeNumericEntities(s) {
   return start === 0 ? s : out + s.slice(start);
 }
 
-// marked's href handling: encodeURI, then turn %25 back into %.
-function normalizeHref(href) {
+// marked's href clean-up: encodeURI, then un-escape %25 back to %.
+function cleanHref(href) {
   try { return encodeURI(href).replace(/%25/g, '%'); } catch { return null; }
 }
 
-// Normalise a link label for lookup: trim, collapse runs of whitespace,
-// then case-fold the way marked does (lower, upper, lower).
-function normalizeLabel(s) {
+// Fold a link label for lookup: trim, squeeze whitespace runs to one
+// space, then case-fold the way marked does (lower, upper, lower).
+function foldLabel(s) {
   return s.trim().replace(/\s+/g, ' ').toLowerCase().toUpperCase().toLowerCase();
 }
 
-// Indent of a line in spaces, with tabs expanded to the next multiple of
-// 4. Returns [width, index of first non-whitespace character].
-function measureIndent(line) {
-  let n = 0, i = 0;
-  for (; i < line.length; i++) {
-    const c = line[i];
-    if (c === ' ') n++;
-    else if (c === '\t') n += 4 - (n % 4);
-    else break;
-  }
-  return [n, i];
+// ---------- line utilities ----------
+
+// Index of the '\n' that ends the line starting at i, or the string end.
+function lineEnd(s, i) {
+  const n = s.indexOf('\n', i);
+  return n === -1 ? s.length : n;
 }
 
-// Expand tabs to spaces, tracking the column we start at.
-function expandTabStops(s, col) {
+// Is the line starting at i blank (spaces/tabs only)?
+function blankAt(s, i) {
+  const e = lineEnd(s, i);
+  for (let j = i; j < e; j++) if (s[j] !== ' ' && s[j] !== '\t') return false;
+  return true;
+}
+
+// Expand tabs to spaces starting from column `col`.
+function expandTabs(s, col) {
   if (s.indexOf('\t') === -1) return s;
   let out = '', c = col;
   for (let i = 0; i < s.length; i++) {
@@ -126,26 +116,27 @@ function expandTabStops(s, col) {
   return out;
 }
 
-// Drop trailing blank lines the way marked does: keep the text when at
-// most two lines follow the last non-blank one, otherwise cut them.
-function dropTrailingBlankLines(s) {
+// Drop trailing blank lines the way marked does: when at most two lines
+// follow the last non-blank line the text is kept as-is, otherwise the
+// blank tail is cut.
+function trimBlankTail(s) {
   const lines = s.split('\n');
   let t = lines.length - 1;
-  while (t >= 0 && lineIsBlank(lines[t])) t--;
+  while (t >= 0 && blankLine(lines[t])) t--;
   if (lines.length - t <= 2) return s;
   return lines.slice(0, t + 1).join('\n');
 }
 
-// Remove a trailing run of one character.
-function stripTrailingRun(s, ch) {
+// Cut a trailing run of one character off a string.
+function stripRun(s, ch) {
   let n = s.length;
   while (n > 0 && s[n - 1] === ch) n--;
   return s.slice(0, n);
 }
 
-// Split a table row on unescaped pipes. A pipe preceded by an even number
-// of backslashes separates cells; an odd number means it is escaped.
-function splitRowCells(s, ncols) {
+// Split a table row on unescaped pipes. A pipe counts as a separator
+// only when preceded by an even number of backslashes.
+function splitCells(s, ncols) {
   let t = '';
   for (let i = 0; i < s.length; i++) {
     if (s[i] === '|') {
@@ -165,10 +156,10 @@ function splitRowCells(s, ncols) {
   return cells;
 }
 
-// Walk a string tracking paren depth: the index of the first unmatched
-// ')', -2 when a '(' is left unclosed, -1 when balanced (or no parens).
-// A backslash hides the next character.
-function parenDepth(s) {
+// Walk a string counting paren depth: index of the first unmatched ')',
+// -2 when a '(' is left open, -1 when balanced (or paren-free).
+// A backslash hides the character after it.
+function parenScan(s) {
   if (s.indexOf('(') === -1 && s.indexOf(')') === -1) return -1;
   let depth = 0;
   for (let i = 0; i < s.length; i++) {
@@ -179,44 +170,26 @@ function parenDepth(s) {
   return depth > 0 ? -2 : -1;
 }
 
-// ============================ BLOCK LEXER ============================
+// ---------- per-parse state ----------
 
-// State shared by the block and inline phases of one parse.
-function freshState() {
+function newState() {
   return {
-    links: Object.create(null), // normalised label -> {href, title}
-    queue: [],                  // inline jobs: tokens awaiting inline parsing
-    inLink: false,              // inside a raw <a ...> (persists across paragraphs)
-    inRawBlock: false,          // inside <pre>/<code>/<kbd>/<script> (reset per job)
-    linkParenPossible: true,
-    top: true,                  // at the top level (not inside a list item)
+    defs: Object.create(null), // folded label -> {href, title}
+    jobs: [],                  // paragraph/text tokens awaiting inline parsing
+    inA: false,                // inside a raw <a ...> (lives across paragraphs)
+    inRaw: false,              // inside <pre>/<code>/<kbd>/<script> (reset per job)
+    parenOk: true,
+    top: true,                 // top level (false while lexing a list item)
   };
 }
 
-// Position of the '\n' ending the line that starts at i, or the end.
-function endOfLine(s, i) {
-  const n = s.indexOf('\n', i);
-  return n === -1 ? s.length : n;
-}
+// ============================ BLOCK LEXER ============================
 
-// Is the line starting at i made only of spaces and tabs?
-function lineIsBlankAt(s, i) {
-  const e = endOfLine(s, i);
-  for (let j = i; j < e; j++) if (s[j] !== ' ' && s[j] !== '\t') return false;
-  return true;
-}
+// --- predicates: does a line start a block construct? ---
 
-// Width of the run of leading spaces, capped at `max`.
-function leadingSpaces(s, i, max) {
-  let n = 0;
-  while (n < max && s[i + n] === ' ') n++;
-  return n;
-}
-
-// --- line predicates (block starts) ---
-
-// Thematic break: up to 3 spaces, then 3+ of -, _ or * with spaces/tabs.
-function lineIsRule(s, i) {
+// Thematic break: at most 3 spaces, then 3+ of one of -, _ or *,
+// with spaces/tabs between them.
+function hrLine(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   const ch = s[p];
@@ -232,8 +205,8 @@ function lineIsRule(s, i) {
   return count >= 3;
 }
 
-// ATX heading: up to 3 spaces, 1-6 #, then a space, tab or end of line.
-function lineIsAtx(s, i) {
+// ATX heading: at most 3 spaces, 1-6 #, then space, tab or end of line.
+function atxLine(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   let n = 0;
@@ -243,10 +216,10 @@ function lineIsAtx(s, i) {
   return c === undefined || c === '\n' || c === ' ' || c === '\t';
 }
 
-// Fenced code start: up to 3 spaces, 3+ backticks or tildes. A backtick
-// fence whose info string holds a backtick is not a fence. Returns the
-// fence length, or 0.
-function fenceLengthAt(s, i) {
+// Fenced code opening: at most 3 spaces, 3+ backticks or tildes. A
+// backtick fence whose info string contains a backtick is not a fence.
+// Returns the fence length, or 0.
+function fenceAt(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   const ch = s[p];
@@ -255,23 +228,23 @@ function fenceLengthAt(s, i) {
   while (s[p] === ch) { p++; n++; }
   if (n < 3) return 0;
   if (ch === '`') {
-    const le = endOfLine(s, p);
+    const le = lineEnd(s, p);
     if (s.slice(p, le).indexOf('`') !== -1) return 0;
   }
   return n;
 }
 
-// Blockquote start: up to 3 spaces then '>'.
-function lineIsQuote(s, i) {
+// Blockquote opening: at most 3 spaces then '>'.
+function quoteLine(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   return s[p] === '>';
 }
 
-// List item start: up to 3 spaces, a bullet (* + -) or 1-9 digits plus
-// '.' or ')', followed by space, tab, newline or end. Returns the bullet
-// length including leading spaces, or 0.
-function bulletLengthAt(s, i) {
+// List item opening: at most 3 spaces, a bullet (* + -) or 1-9 digits
+// plus '.' or ')', followed by space, tab, newline or end. Returns the
+// marker length including leading spaces, or 0.
+function bulletAt(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   const c = s[p];
@@ -293,7 +266,7 @@ function bulletLengthAt(s, i) {
 }
 
 // Indented-code line: 4 spaces, or up to 3 spaces plus a tab, then content.
-function lineIsIndentedCode(s, i) {
+function codeLine(s, i) {
   let p = i, sp = 0;
   while (sp < 4 && s[p] === ' ') { p++; sp++; }
   if (sp === 4) return s[p] !== '\n' && s[p] !== undefined;
@@ -301,9 +274,9 @@ function lineIsIndentedCode(s, i) {
   return false;
 }
 
-// Setext underline: up to 3 spaces, a run of = or -, then spaces/tabs.
+// Setext underline: at most 3 spaces, a run of = or -, then spaces/tabs.
 // Returns 1 for '=', 2 for '-', 0 otherwise.
-function setextDepthAt(s, i) {
+function setextAt(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   const ch = s[p];
@@ -315,16 +288,17 @@ function setextDepthAt(s, i) {
 }
 
 // Can the line at i interrupt a paragraph? Rules, ATX headings, fences,
-// blockquotes, lists, HTML blocks and blank lines can. (Setext underlines
-// and table delimiter lines do not — the setext/table readers run first.)
-function lineInterruptsPara(s, i, clamp) {
-  if (lineIsBlankAt(s, i)) return true;
-  if (lineIsRule(s, i)) return true;
-  if (lineIsAtx(s, i)) return true;
-  if (fenceLengthAt(s, i)) return true;
-  if (lineIsQuote(s, i)) return true;
-  if (bulletLengthAt(s, i)) return true;
-  if (htmlStartsAt(s, i, clamp, 'block')) return true;
+// blockquotes, lists, HTML blocks and blank lines can. (Setext
+// underlines and table delimiter lines do not — the setext/table
+// readers run first.)
+function interruptsPara(s, i, clamp) {
+  if (blankAt(s, i)) return true;
+  if (hrLine(s, i)) return true;
+  if (atxLine(s, i)) return true;
+  if (fenceAt(s, i)) return true;
+  if (quoteLine(s, i)) return true;
+  if (bulletAt(s, i)) return true;
+  if (htmlAt(s, i, clamp, 'block')) return true;
   return false;
 }
 
@@ -334,26 +308,26 @@ function lineInterruptsPara(s, i, clamp) {
 // text and heading tokens carry `text` (inline source); their inline
 // parsing is queued and runs later.
 
-function readSpace(s) {
+function takeBlank(s) {
   let i = 0;
   while (i < s.length) {
-    if (!lineIsBlankAt(s, i)) break;
-    const e = endOfLine(s, i);
+    if (!blankAt(s, i)) break;
+    const e = lineEnd(s, i);
     i = e < s.length ? e + 1 : e;
   }
-  return i > 0 ? { type: 'space', raw: s.slice(0, i) } : null;
+  return i > 0 ? { type: 'blank', raw: s.slice(0, i) } : null;
 }
 
-function readIndentedCode(s) {
+function takeIndentCode(s) {
   let i = 0, end = 0;
   while (i < s.length) {
-    if (!lineIsIndentedCode(s, i)) break;
-    const e = endOfLine(s, i);
+    if (!codeLine(s, i)) break;
+    const e = lineEnd(s, i);
     end = e;
     i = e < s.length ? e + 1 : e;
-    // Blank lines following a code line belong to the block.
-    while (i < s.length && lineIsBlankAt(s, i)) {
-      const be = endOfLine(s, i);
+    // Blank lines after a code line belong to the block.
+    while (i < s.length && blankAt(s, i)) {
+      const be = lineEnd(s, i);
       end = be;
       i = be < s.length ? be + 1 : be;
     }
@@ -362,13 +336,13 @@ function readIndentedCode(s) {
   let rawEnd = end;
   if (rawEnd < s.length && s[rawEnd] === '\n') rawEnd++;
   const matched = s.slice(0, rawEnd);
-  const raw = dropTrailingBlankLines(matched);
+  const raw = trimBlankTail(matched);
   // Strip 1-4 leading spaces (or up to 3 spaces plus a tab) per line.
   const text = raw.replace(/^(?: {0,3}\t| {1,4})/gm, '');
   return { type: 'code', raw, text, lang: null };
 }
 
-function readFence(s) {
+function takeFence(s) {
   let p = 0, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   const ch = s[p];
@@ -377,14 +351,14 @@ function readFence(s) {
   while (s[q] === ch) q++;
   const fenceLen = q - p;
   if (fenceLen < 3) return null;
-  const le = endOfLine(s, q);
+  const le = lineEnd(s, q);
   const info = s.slice(q, le);
   if (ch === '`' && info.indexOf('`') !== -1) return null;
   const cstart = le < s.length ? le + 1 : s.length;
   // Look for the closing fence.
   let k = cstart, contentEnd = s.length, closeEnd = s.length, found = false;
   while (k < s.length) {
-    const kle = endOfLine(s, k);
+    const kle = lineEnd(s, k);
     const line = s.slice(k, kle);
     let r = 0;
     while (r < 3 && line[r] === ' ') r++;
@@ -422,7 +396,7 @@ function readFence(s) {
   return { type: 'code', raw, text: content, lang: lang || null };
 }
 
-function readAtx(s) {
+function takeAtx(s) {
   let p = 0, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   let n = 0;
@@ -430,17 +404,17 @@ function readAtx(s) {
   if (n === 0 || n > 6) return null;
   const c = s[p];
   if (c !== undefined && c !== '\n' && c !== ' ' && c !== '\t') return null;
-  const le = endOfLine(s, p);
+  const le = lineEnd(s, p);
   let text = s.slice(p, le).trim();
   if (text.endsWith('#')) {
-    const stripped = stripTrailingRun(text, '#');
+    const stripped = stripRun(text, '#');
     if (stripped === '' || stripped.endsWith(' ') || stripped.endsWith('\t')) text = stripped.trim();
   }
-  const raw = stripTrailingRun(s.slice(0, le), '\n');
-  return { type: 'heading', raw, depth: n, text };
+  const raw = stripRun(s.slice(0, le), '\n');
+  return { type: 'head', raw, depth: n, text };
 }
 
-function readRule(s) {
+function takeHr(s) {
   let p = 0, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   const ch = s[p];
@@ -460,44 +434,44 @@ function readRule(s) {
 
 // ---------- HTML tag helpers ----------
 
-function isHtmlSpace(c) { return c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v'; }
-function isAlnumCode(c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
+function htmlSpace(c) { return c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v'; }
+function alnumCode(c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
 
 // Parse `<name attr...>` or `<name attr.../>` starting at s[i] === '<'.
 // `block` selects the type-7 attribute rules (spaces only, no newline in
 // quoted values); otherwise the inline rules. Returns the end index or -1.
-function matchTagOpen(s, i, block) {
+function openTagEnd(s, i, block) {
   let j = i + 1;
-  if (!isAlphaChar(s.charCodeAt(j))) return -1;
+  if (!alphaChar(s.charCodeAt(j))) return -1;
   j++;
-  while (j < s.length && (isAlnumCode(s.charCodeAt(j)) || s[j] === '-')) j++;
+  while (j < s.length && (alnumCode(s.charCodeAt(j)) || s[j] === '-')) j++;
   for (;;) {
     let k = j;
     if (block) { while (s[k] === ' ') k++; }
-    else { while (k < s.length && isHtmlSpace(s[k])) k++; }
+    else { while (k < s.length && htmlSpace(s[k])) k++; }
     if (k === j) {
       if (s[j] === '/') return s[j + 1] === '>' ? j + 2 : -1;
       if (s[j] === '>') return j + 1;
       return -1;
     }
     const nc = s.charCodeAt(k);
-    if (!isAlphaChar(nc) && s[k] !== '_' && s[k] !== ':') {
+    if (!alphaChar(nc) && s[k] !== '_' && s[k] !== ':') {
       if (s[k] === '/') return s[k + 1] === '>' ? k + 2 : -1;
       if (s[k] === '>') return k + 1;
       return -1;
     }
     let n = k + 1;
-    while (n < s.length && (isWordChar(s.charCodeAt(n)) || s[n] === '.' || s[n] === ':' || s[n] === '-')) n++;
+    while (n < s.length && (wordChar(s.charCodeAt(n)) || s[n] === '.' || s[n] === ':' || s[n] === '-')) n++;
     // Look for '=' past optional whitespace, but only consume that
     // whitespace when an '=' follows: a bare attribute name is followed
     // by the whitespace that separates it from the next attribute.
     let v = n;
     if (block) { while (s[v] === ' ') v++; }
-    else { while (v < s.length && isHtmlSpace(s[v])) v++; }
+    else { while (v < s.length && htmlSpace(s[v])) v++; }
     if (s[v] !== '=') { j = n; continue; }
     v++;
     if (block) { while (s[v] === ' ') v++; }
-    else { while (v < s.length && isHtmlSpace(s[v])) v++; }
+    else { while (v < s.length && htmlSpace(s[v])) v++; }
     const q = s[v];
     if (q === '"' || q === "'") {
       const e = s.indexOf(q, v + 1);
@@ -506,7 +480,7 @@ function matchTagOpen(s, i, block) {
       v = e + 1;
     } else {
       let w = v;
-      while (w < s.length && !isHtmlSpace(s[w]) && s[w] !== '"' && s[w] !== "'" && s[w] !== '=' && s[w] !== '<' && s[w] !== '>' && s[w] !== '`') w++;
+      while (w < s.length && !htmlSpace(s[w]) && s[w] !== '"' && s[w] !== "'" && s[w] !== '=' && s[w] !== '<' && s[w] !== '>' && s[w] !== '`') w++;
       if (w === v) return -1;
       v = w;
     }
@@ -515,18 +489,18 @@ function matchTagOpen(s, i, block) {
 }
 
 // Parse `</name>` (optional whitespace before `>`) starting at s[i] === '<'.
-function matchTagClose(s, i) {
+function closeTagEnd(s, i) {
   let j = i + 2;
-  if (!isAlphaChar(s.charCodeAt(j))) return -1;
+  if (!alphaChar(s.charCodeAt(j))) return -1;
   j++;
-  while (j < s.length && (isAlnumCode(s.charCodeAt(j)) || s[j] === '-')) j++;
-  while (j < s.length && isHtmlSpace(s[j])) j++;
+  while (j < s.length && (alnumCode(s.charCodeAt(j)) || s[j] === '-')) j++;
+  while (j < s.length && htmlSpace(s[j])) j++;
   return s[j] === '>' ? j + 1 : -1;
 }
 
 // Parse an inline HTML tag, comment, processing instruction, declaration
 // or CDATA section starting at s[i] === '<'. Returns the end index or -1.
-function parseInlineTag(s, i) {
+function inlineTagEnd(s, i) {
   if (s.startsWith('<!--', i)) {
     if (s[i + 4] === '-') return s[i + 5] === '>' ? i + 6 : i + 5;
     if (s[i + 4] === '>') return i + 5; // <!--> is a complete empty comment
@@ -534,7 +508,7 @@ function parseInlineTag(s, i) {
     return c === -1 ? s.length : c + 3;
   }
   const c1 = s[i + 1];
-  if (c1 === '/') return matchTagClose(s, i);
+  if (c1 === '/') return closeTagEnd(s, i);
   if (c1 === '?') {
     const c = s.indexOf('?>', i + 2);
     return c === -1 ? -1 : c + 2;
@@ -545,20 +519,20 @@ function parseInlineTag(s, i) {
       return c === -1 ? -1 : c + 3;
     }
     let j = i + 2;
-    if (!isAlphaChar(s.charCodeAt(j))) return -1;
-    while (isAlphaChar(s.charCodeAt(j))) j++;
-    if (!isHtmlSpace(s[j])) return -1;
+    if (!alphaChar(s.charCodeAt(j))) return -1;
+    while (alphaChar(s.charCodeAt(j))) j++;
+    if (!htmlSpace(s[j])) return -1;
     const gt = s.indexOf('>', j);
     return gt === -1 ? -1 : gt + 1;
   }
-  if (isAlphaChar(s.charCodeAt(i + 1))) return matchTagOpen(s, i, false);
+  if (alphaChar(s.charCodeAt(i + 1))) return openTagEnd(s, i, false);
   return -1;
 }
 
 // Can a line start an HTML block? `mode` is 'block' (the block reader's
 // type-6 test), 'para' (paragraph interruption test) or 'line' (the
 // single-line test used inside list items). `maxSp` caps leading spaces.
-function htmlStartsAt(s, i, maxSp, mode) {
+function htmlAt(s, i, maxSp, mode) {
   let p = i, sp = 0;
   while (sp < maxSp && s[p] === ' ') { p++; sp++; }
   if (s[p] !== '<') return false;
@@ -569,7 +543,7 @@ function htmlStartsAt(s, i, maxSp, mode) {
   if (/^<![A-Za-z]/.test(s.slice(p, p + 3)) || s.startsWith('<![CDATA[', p)) return true;
   const tm = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(s.slice(p));
   if (!tm) return false;
-  if (!BLOCK_TAG_NAMES.has(tm[1].toLowerCase())) return false;
+  if (!BLOCK_TAGS.has(tm[1].toLowerCase())) return false;
   const after = s[p + tm[0].length];
   if (mode === 'block') return after === ' ' || after === '\t' || after === '\n' || after === undefined || after === '/' || after === '>';
   if (mode === 'para') return after === ' ' || after === '\n' || after === '/' || after === '>';
@@ -578,16 +552,16 @@ function htmlStartsAt(s, i, maxSp, mode) {
 
 // End of a type 6/7 HTML block: the index where the content plus the
 // blank-line terminator ends, or the string length.
-function htmlBlockStop(s) {
+function htmlBlockEnd(s) {
   let i = 0;
   while (i < s.length) {
-    const le = endOfLine(s, i);
-    if (lineIsBlankAt(s, i)) {
+    const le = lineEnd(s, i);
+    if (blankAt(s, i)) {
       if (le >= s.length) return s.length;
       let j = le + 1;
       while (j < s.length) {
-        const le2 = endOfLine(s, j);
-        if (lineIsBlankAt(s, j) && le2 < s.length) j = le2 + 1;
+        const le2 = lineEnd(s, j);
+        if (blankAt(s, j) && le2 < s.length) j = le2 + 1;
         else break;
       }
       return j;
@@ -598,21 +572,21 @@ function htmlBlockStop(s) {
 }
 
 // Skip to the end of the line containing `pos`, then past newlines.
-function skipLineAndNewlines(s, pos) {
-  let q = endOfLine(s, pos);
+function skipPastLine(s, pos) {
+  let q = lineEnd(s, pos);
   if (q < s.length) q++;
   while (q < s.length && s[q] === '\n') q++;
   return q;
 }
 
-function findCloseTagCI(s, from, tag) {
+function closeTagSearch(s, from, tag) {
   const lower = s.toLowerCase();
   const needle = '</' + tag.toLowerCase() + '>';
   const idx = lower.indexOf(needle, from);
   return idx === -1 ? -1 : idx + needle.length;
 }
 
-function readHtmlBlock(s) {
+function takeHtml(s) {
   let p = 0, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   if (s[p] !== '<') return null;
@@ -621,9 +595,9 @@ function readHtmlBlock(s) {
   let m = /^<(script|pre|style|textarea)(?:[\s>]|$)/i.exec(rest);
   if (m) {
     const tag = m[1].toLowerCase();
-    const closeEnd = findCloseTagCI(s, p, tag);
-    const end = closeEnd === -1 ? s.length : skipLineAndNewlines(s, closeEnd);
-    const raw = dropTrailingBlankLines(s.slice(0, end));
+    const closeEnd = closeTagSearch(s, p, tag);
+    const end = closeEnd === -1 ? s.length : skipPastLine(s, closeEnd);
+    const raw = trimBlankTail(s.slice(0, end));
     return { type: 'html', raw, text: raw };
   }
   // type 2: comment
@@ -635,37 +609,37 @@ function readHtmlBlock(s) {
       const c = s.indexOf('-->', p + 4);
       end = c === -1 ? s.length : c + 3;
     }
-    end = skipLineAndNewlines(s, end);
-    const raw = dropTrailingBlankLines(s.slice(0, end));
+    end = skipPastLine(s, end);
+    const raw = trimBlankTail(s.slice(0, end));
     return { type: 'html', raw, text: raw };
   }
   // type 3: <? ... ?>
   if (rest.startsWith('<?')) {
     const c = s.indexOf('?>', p + 2);
-    const end = c === -1 ? s.length : skipLineAndNewlines(s, c + 2);
-    const raw = dropTrailingBlankLines(s.slice(0, end));
+    const end = c === -1 ? s.length : skipPastLine(s, c + 2);
+    const raw = trimBlankTail(s.slice(0, end));
     return { type: 'html', raw, text: raw };
   }
   // type 4: <!A ... >
   if (/^<![A-Za-z]/.test(rest)) {
     const gt = s.indexOf('>', p + 3);
-    const end = gt === -1 ? s.length : skipLineAndNewlines(s, gt + 1);
-    const raw = dropTrailingBlankLines(s.slice(0, end));
+    const end = gt === -1 ? s.length : skipPastLine(s, gt + 1);
+    const raw = trimBlankTail(s.slice(0, end));
     return { type: 'html', raw, text: raw };
   }
   // type 5: <![CDATA[ ... ]]>
   if (rest.startsWith('<![CDATA[')) {
     const c = s.indexOf(']]>', p + 9);
-    const end = c === -1 ? s.length : skipLineAndNewlines(s, c + 3);
-    const raw = dropTrailingBlankLines(s.slice(0, end));
+    const end = c === -1 ? s.length : skipPastLine(s, c + 3);
+    const raw = trimBlankTail(s.slice(0, end));
     return { type: 'html', raw, text: raw };
   }
   // type 6: a block tag (open or close), then anything up to a blank line
   m = /^<\/?([A-Za-z][A-Za-z0-9-]*)/.exec(rest);
-  if (m && BLOCK_TAG_NAMES.has(m[1].toLowerCase())) {
+  if (m && BLOCK_TAGS.has(m[1].toLowerCase())) {
     const after = rest[m[0].length];
     if (after === ' ' || after === '\t' || after === '\n' || after === undefined || after === '/' || after === '>') {
-      const raw = dropTrailingBlankLines(s.slice(0, htmlBlockStop(s)));
+      const raw = trimBlankTail(s.slice(0, htmlBlockEnd(s)));
       return { type: 'html', raw, text: raw };
     }
   }
@@ -673,12 +647,12 @@ function readHtmlBlock(s) {
   if (m) {
     const name = m[1].toLowerCase();
     if (name !== 'script' && name !== 'pre' && name !== 'style' && name !== 'textarea') {
-      const tagEnd = matchTagOpen(s, p, true);
+      const tagEnd = openTagEnd(s, p, true);
       if (tagEnd !== -1) {
         let q = tagEnd;
         while (s[q] === ' ' || s[q] === '\t') q++;
         if (s[q] === '\n' || s[q] === undefined) {
-          const raw = dropTrailingBlankLines(s.slice(0, htmlBlockStop(s)));
+          const raw = trimBlankTail(s.slice(0, htmlBlockEnd(s)));
           return { type: 'html', raw, text: raw };
         }
       }
@@ -686,12 +660,12 @@ function readHtmlBlock(s) {
   }
   // type 7 close tag: </name> alone on its line
   if (rest.startsWith('</')) {
-    const tagEnd = matchTagClose(s, p);
+    const tagEnd = closeTagEnd(s, p);
     if (tagEnd !== -1) {
       let q = tagEnd;
       while (s[q] === ' ' || s[q] === '\t') q++;
       if (s[q] === '\n' || s[q] === undefined) {
-        const raw = dropTrailingBlankLines(s.slice(0, htmlBlockStop(s)));
+        const raw = trimBlankTail(s.slice(0, htmlBlockEnd(s)));
         return { type: 'html', raw, text: raw };
       }
     }
@@ -701,7 +675,7 @@ function readHtmlBlock(s) {
 
 // Does the line at s[i] start a list item that may interrupt a paragraph?
 // Only a non-empty item, and for ordered lists only one starting with 1.
-function listInterruptsPara(s, i) {
+function listBreaksPara(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   const c = s[p];
@@ -726,23 +700,23 @@ function listInterruptsPara(s, i) {
 
 // End index of a paragraph starting at `start` (first line plus
 // continuation lines that are not blank and do not start a block).
-function paragraphStop(s, start) {
-  let i = endOfLine(s, start);
+function paraEnd(s, start) {
+  let i = lineEnd(s, start);
   while (i < s.length) {
     const ns = i + 1;
     if (ns >= s.length) break;
     // A whitespace-only line ends the paragraph only when it is a
     // complete line (followed by a newline); a trailing run of spaces at
     // the very end of the input belongs to the paragraph.
-    if (lineIsBlankAt(s, ns) && endOfLine(s, ns) < s.length) break;
-    if (lineIsRule(s, ns) || lineIsAtx(s, ns) || fenceLengthAt(s, ns) ||
-        lineIsQuote(s, ns) || listInterruptsPara(s, ns) || htmlStartsAt(s, ns, 3, 'para')) break;
-    i = endOfLine(s, ns);
+    if (blankAt(s, ns) && lineEnd(s, ns) < s.length) break;
+    if (hrLine(s, ns) || atxLine(s, ns) || fenceAt(s, ns) ||
+        quoteLine(s, ns) || listBreaksPara(s, ns) || htmlAt(s, ns, 3, 'para')) break;
+    i = lineEnd(s, ns);
   }
   return i;
 }
 
-function readQuote(s, st) {
+function takeQuote(s, st) {
   // Extent: lines starting with `>` plus lazy paragraph continuation lines.
   let pos = 0;
   while (pos < s.length) {
@@ -751,10 +725,10 @@ function readQuote(s, st) {
     if (s[p] !== '>') break;
     let q = p + 1;
     if (s[q] === ' ' || s[q] === '\t') q++;
-    const le = endOfLine(s, q);
+    const le = lineEnd(s, q);
     let restBlank = true;
     for (let t = q; t < le; t++) if (s[t] !== ' ' && s[t] !== '\t') { restBlank = false; break; }
-    const end = restBlank ? le : paragraphStop(s, q);
+    const end = restBlank ? le : paraEnd(s, q);
     pos = end < s.length ? end + 1 : end;
   }
   if (pos === 0) return null;
@@ -773,23 +747,23 @@ function readQuote(s, st) {
     lines = lines.slice(p);
     const h = chunk.join('\n');
     const u = h
-      .replace(/^( {0,3}>)([ \t]+)/gm, (g, b, m) => b + expandTabStops(m, b.length))
+      .replace(/^( {0,3}>)([ \t]+)/gm, (g, b, m) => b + expandTabs(m, b.length))
       .replace(/\n {0,3}((?:=+|-+)[ \t]*)(?=\n|$)/g, '\n    $1')
       .replace(/^ {0,3}>[ \t]?/gm, '');
     sAcc = sAcc ? sAcc + '\n' + h : h;
     rAcc = rAcc ? rAcc + '\n' + u : u;
     const savedTop = st.top;
     st.top = true;
-    lexBlocks(u, tokens, st, true);
+    lex(u, tokens, st, true);
     st.top = savedTop;
     if (lines.length === 0) break;
     const k = tokens[tokens.length - 1];
-    if (k && (k.type === 'code' || k.type === 'heading' || k.type === 'hr' || k.type === 'html' || k.type === 'table')) break;
-    if (k && k.type === 'blockquote') {
+    if (k && (k.type === 'code' || k.type === 'head' || k.type === 'hr' || k.type === 'html' || k.type === 'table')) break;
+    if (k && k.type === 'quote') {
       const g = k;
       const b = lines.join('\n');
       const m = g.raw + '\n' + b.replace(/^ {0,3}>[ \t]?/gm, '');
-      const f = readQuote(m, st);
+      const f = takeQuote(m, st);
       tokens[tokens.length - 1] = f;
       const y = m.substring(f.raw.length).replace(/^\n/, '');
       const R = y ? y.split('\n').length : 0;
@@ -802,7 +776,7 @@ function readQuote(s, st) {
     } else if (k && k.type === 'list') {
       const g = k;
       const b = g.raw + '\n' + lines.join('\n');
-      const mm = readList(b, st);
+      const mm = takeList(b, st);
       tokens[tokens.length - 1] = mm;
       const f = mm.raw.length > g.raw.length ? b.slice(g.raw.length + 1, mm.raw.length).split('\n').length : 0;
       if (f > 0) {
@@ -814,14 +788,14 @@ function readQuote(s, st) {
       continue;
     }
   }
-  return { type: 'blockquote', raw: sAcc, tokens, text: rAcc };
+  return { type: 'quote', raw: sAcc, tokens, text: rAcc };
 }
 
 // Match a list item at the start of `s`: `^( {0,3}BULLET)((?:[ \t][^\n]*)?(?:\n|$))`
 // `marker` describes the bullet to accept: null for any bullet, {term}
 // for an ordered bullet ending in '.' or ')', {ch} for one unordered
 // bullet character.
-function matchListItem(s, marker) {
+function listItemAt(s, marker) {
   let p = 0, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   let mlen = 0;
@@ -851,7 +825,7 @@ function matchListItem(s, marker) {
   // rest: (?:[ \t][^\n]*)?(?:\n|$)
   let q = bulletEnd;
   if (s[q] === ' ' || s[q] === '\t') {
-    const le = endOfLine(s, q);
+    const le = lineEnd(s, q);
     q = le;
   }
   const totalLen = q < s.length ? q + 1 : q;
@@ -860,7 +834,7 @@ function matchListItem(s, marker) {
 
 // A line starts a list item of any kind (used inside table bodies and the
 // list loop's break checks). `clamp` limits leading spaces.
-function nextBulletAt(s, i, clamp) {
+function bulletAtPos(s, i, clamp) {
   let p = i, sp = 0;
   while (sp < clamp && s[p] === ' ') { p++; sp++; }
   const c = s[p];
@@ -880,28 +854,28 @@ function nextBulletAt(s, i, clamp) {
   return false;
 }
 
-function firstNonSpace(s) {
+function firstNonWs(s) {
   for (let i = 0; i < s.length; i++) if (s[i] !== ' ') return i;
   return -1;
 }
 
 // First line of s (up to the first '\n', or the whole string).
-function firstLineOf(s) {
-  return s.slice(0, endOfLine(s, 0));
+function firstLine(s) {
+  return s.slice(0, lineEnd(s, 0));
 }
 
 // Expand the leading whitespace run of a line to spaces (tabs to the next
 // multiple of 4 from `col`); a run without tabs is returned unchanged.
-function expandLeadingWS(line, col) {
+function expandLead(line, col) {
   let r = 0, hasTab = false;
   while (r < line.length && (line[r] === ' ' || line[r] === '\t')) { if (line[r] === '\t') hasTab = true; r++; }
   if (!hasTab) return line;
-  return expandTabStops(line.slice(0, r), col) + line.slice(r);
+  return expandTabs(line.slice(0, r), col) + line.slice(r);
 }
 
 // Index of the first non-space character with each tab counted as 4
 // spaces; -1 when the string is all spaces and tabs.
-function firstNonSpaceTab4(s) {
+function firstNonWsTab(s) {
   let n = 0;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
@@ -913,7 +887,7 @@ function firstNonSpaceTab4(s) {
 }
 
 // Does s end with a blank line (newline, spaces/tabs, newline, spaces/tabs)?
-function endsWithBlankLine(s) {
+function endsBlank(s) {
   let i = s.length;
   while (i > 0 && (s[i - 1] === ' ' || s[i - 1] === '\t')) i--;
   if (i === 0 || s[i - 1] !== '\n') return false;
@@ -923,17 +897,17 @@ function endsWithBlankLine(s) {
 }
 
 // Does `text` (one or two lines joined by \n) form a setext heading?
-function isSetextHeading(text) {
+function setextText(text) {
   const nl = text.indexOf('\n');
   if (nl === -1) return false;
   const first = text.slice(0, nl);
-  if (first === '' || bulletLengthAt(first + '\n', 0)) return false;
-  const d = setextDepthAt(text, nl + 1);
+  if (first === '' || bulletAt(first + '\n', 0)) return false;
+  const d = setextAt(text, nl + 1);
   return d !== 0;
 }
 
-function readList(s, st) {
-  const first = matchListItem(s, null);
+function takeList(s, st) {
+  const first = listItemAt(s, null);
   if (!first) return null;
   const bulletText = s.slice(0, first.bulletLen).trim();
   const ordered = bulletText.length > 1;
@@ -942,20 +916,20 @@ function readList(s, st) {
   let loose = false, pFlag = false;
   let e = s, consumed = 0;
   while (e.length > 0) {
-    const t = matchListItem(e, marker);
-    if (!t || lineIsRule(e, 0)) break;
+    const t = listItemAt(e, marker);
+    if (!t || hrLine(e, 0)) break;
     const k = consumed;
     e = e.substring(t.totalLen);
     consumed += t.totalLen;
-    const g = firstLineOf(t.rest);
+    const g = firstLine(t.rest);
     const b = t.bulletLen;
-    const m = expandLeadingWS(g, b);
-    const f = firstLineOf(e);
+    const m = expandLead(g, b);
+    const f = firstLine(e);
     const y = !m.trim();
     let R, d;
     if (y) { R = b + 1; d = ''; }
     else {
-      R = firstNonSpace(m);
+      R = firstNonWs(m);
       if (R > 4) R = 1;
       d = m.slice(R);
       R += b;
@@ -966,19 +940,19 @@ function readList(s, st) {
       let mm = m;
       let yy = y;
       while (e.length > 0) {
-        const U = firstLineOf(e);
+        const U = firstLine(e);
         const f2 = U;
-        const Z = expandLeadingWS(f2, 0);
+        const Z = expandLead(f2, 0);
         const cl = Math.max(0, Math.min(3, R - 1));
-        if (fenceStartLine(f2, cl) || headingBeginLine(f2, cl) || htmlStartsAt(f2, 0, cl, 'line') ||
-            blockquoteBeginLine(f2, cl) || nextBulletAt(f2, 0, cl) || hrLineAt(f2, cl)) break;
-        if (firstNonSpace(Z) >= R || !f2.trim()) {
+        if (fenceLine(f2, cl) || atxLineStart(f2, cl) || htmlAt(f2, 0, cl, 'line') ||
+            quoteLineStart(f2, cl) || bulletAtPos(f2, 0, cl) || hrLineStart(f2, cl)) break;
+        if (firstNonWs(Z) >= R || !f2.trim()) {
           d += '\n' + Z.slice(R);
         } else {
-          if (yy || firstNonSpaceTab4(mm) >= 4 ||
-              fenceStartLine(mm, 0) || headingBeginLine(mm, 0) || htmlStartsAt(mm, 0, 0, 'line') || hrLineAt(mm, 0)) break;
+          if (yy || firstNonWsTab(mm) >= 4 ||
+              fenceLine(mm, 0) || atxLineStart(mm, 0) || htmlAt(mm, 0, 0, 'line') || hrLineStart(mm, 0)) break;
           let qe = f2;
-          if (/^ {0,3}(?:=+|-+) *$/.test(f2) && isSetextHeading(mm + '\n' + f2)) {
+          if (/^ {0,3}(?:=+|-+) *$/.test(f2) && setextText(mm + '\n' + f2)) {
             qe = '    ' + Z.replace(/^ {0,3}/, '');
           }
           d += '\n' + qe;
@@ -992,9 +966,9 @@ function readList(s, st) {
     const A = s.slice(k, consumed);
     if (!loose) {
       if (pFlag) loose = true;
-      else if (endsWithBlankLine(A)) pFlag = true;
+      else if (endsBlank(A)) pFlag = true;
     }
-    items.push({ type: 'list_item', raw: A, task: false, loose: false, text: d, tokens: [] });
+    items.push({ type: 'item', raw: A, task: false, loose: false, text: d, tokens: [] });
   }
   if (items.length === 0) return null;
   const h = items[items.length - 1];
@@ -1006,9 +980,9 @@ function readList(s, st) {
   // Block-tokenize each item's text; detect looseness from blank lines.
   for (const it of items) {
     st.top = false;
-    it.tokens = lexBlocks(it.text, [], st, false);
+    it.tokens = lex(it.text, [], st, false);
     if (!loose) {
-      const spaces = it.tokens.filter((t) => t.type === 'space');
+      const spaces = it.tokens.filter((t) => t.type === 'blank');
       if (spaces.length > 0 && spaces.some((t) => /\n.*\n/.test(t.raw))) loose = true;
     }
   }
@@ -1016,13 +990,13 @@ function readList(s, st) {
   // Task list fix-up: strip the marker, insert a checkbox token.
   for (const it of items) {
     const d0 = it.tokens[0];
-    if (it.task && (d0 && (d0.type === 'text' || d0.type === 'paragraph'))) {
+    if (it.task && (d0 && (d0.type === 'text' || d0.type === 'para'))) {
       const km = /^\[[ xX]\]/.exec(it.text);
       it.text = it.text.replace(/^\[[ xX]\][ \t]+/, '');
       d0.raw = d0.raw.replace(/^\[[ xX]\][ \t]+/, '');
       d0.text = d0.text.replace(/^\[[ xX]\][ \t]+/, '');
       if (km) {
-        const g = { type: 'checkbox', raw: km[0] + ' ', checked: km[0] !== '[ ]' };
+        const g = { type: 'check', raw: km[0] + ' ', checked: km[0] !== '[ ]' };
         it.checked = g.checked;
         if (loose) {
           // The checkbox becomes the first inline element of the paragraph.
@@ -1038,14 +1012,14 @@ function readList(s, st) {
   if (loose) {
     for (const it of items) {
       it.loose = true;
-      for (const tk of it.tokens) if (tk.type === 'text') tk.type = 'paragraph';
+      for (const tk of it.tokens) if (tk.type === 'text') tk.type = 'para';
     }
   }
   return { type: 'list', raw, ordered, start: ordered ? parseInt(bulletText.slice(0, -1), 10) : '', loose, items };
 }
 
 // Line-based variants of the break checks (input is a single line, no \n).
-function fenceStartLine(line, clamp) {
+function fenceLine(line, clamp) {
   let p = 0, sp = 0;
   while (sp < clamp && line[p] === ' ') { p++; sp++; }
   const ch = line[p];
@@ -1056,7 +1030,7 @@ function fenceStartLine(line, clamp) {
   if (ch === '`' && line.slice(p).indexOf('`') !== -1) return false;
   return true;
 }
-function headingBeginLine(line, clamp) {
+function atxLineStart(line, clamp) {
   let p = 0, sp = 0;
   while (sp < clamp && line[p] === ' ') { p++; sp++; }
   let n = 0;
@@ -1065,12 +1039,12 @@ function headingBeginLine(line, clamp) {
   const c = line[p];
   return c === undefined || c === ' ' || c === '\t';
 }
-function blockquoteBeginLine(line, clamp) {
+function quoteLineStart(line, clamp) {
   let p = 0, sp = 0;
   while (sp < clamp && line[p] === ' ') { p++; sp++; }
   return line[p] === '>';
 }
-function hrLineAt(line, clamp) {
+function hrLineStart(line, clamp) {
   let p = 0, sp = 0;
   while (sp < clamp && line[p] === ' ') { p++; sp++; }
   const ch = line[p];
@@ -1084,16 +1058,15 @@ function hrLineAt(line, clamp) {
   }
   return count >= 3;
 }
-
 // Unescape backslash-escaped ASCII punctuation: \X -> X.
-function unescapePunct(s) {
+function unesc(s) {
   if (s.indexOf('\\') === -1) return s;
   return s.replace(/\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])/g, '$1');
 }
 
 // Parse a link title starting at s[i] ('"' or "'" or '('). Returns
 // {title, end} (title without the quotes) or null.
-function parseTitle(s, i) {
+function titleAt(s, i) {
   const q = s[i];
   if (q === '"') {
     let j = i + 1;
@@ -1130,7 +1103,7 @@ function parseTitle(s, i) {
   return null;
 }
 
-function readDef(s, st) {
+function takeDef(s, st) {
   let p = 0, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   if (s[p] !== '[') return null;
@@ -1144,7 +1117,7 @@ function readDef(s, st) {
     if (c === '[' || c === ']') break;
     if (c === '\n') {
       const ns = k + 1;
-      if (ns >= s.length || lineIsBlankAt(s, ns)) break;
+      if (ns >= s.length || blankAt(s, ns)) break;
       k++; continue;
     }
     k++;
@@ -1163,7 +1136,7 @@ function readDef(s, st) {
   // Destination: <...> or a run of non-space characters.
   let dest, angled = false;
   if (s[m] === '<') {
-    const le = endOfLine(s, m);
+    const le = lineEnd(s, m);
     const gt = s.indexOf('>', m);
     if (gt === -1 || gt > le) return null;
     dest = s.slice(m + 1, gt);
@@ -1176,7 +1149,7 @@ function readDef(s, st) {
     dest = s.slice(m, e);
     m = e;
   }
-  if (!angled && parenDepth(dest) !== -1) return null;
+  if (!angled && parenScan(dest) !== -1) return null;
   // Optional title, on this line or the next.
   let title;
   let t = m;
@@ -1194,7 +1167,7 @@ function readDef(s, st) {
       ok = true;
     }
     if (ok) {
-      const tp = parseTitle(s, q);
+      const tp = titleAt(s, q);
       if (tp) { title = tp.title; t = tp.end; hasTitle = true; }
     }
   }
@@ -1211,16 +1184,16 @@ function readDef(s, st) {
   const raw = s.slice(0, end);
   return {
     type: 'def',
-    tag: normalizeLabel(label),
+    tag: foldLabel(label),
     raw,
-    href: unescapePunct(dest),
-    title: hasTitle ? unescapePunct(title) : undefined,
+    href: unesc(dest),
+    title: hasTitle ? unesc(title) : undefined,
   };
 }
 
 // A line looks like a table delimiter row: an optional |, then one or more
 // groups of (colons/dashes/spaces + |), then colons/dashes/spaces, then EOL.
-function isTableDelimLine(s, i) {
+function delimLine(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   let j = p;
@@ -1237,7 +1210,7 @@ function isTableDelimLine(s, i) {
 }
 
 // A line starts a bullet character (no space required after it).
-function bulletCharAt(s, i) {
+function bulletChar(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   const c = s[p];
@@ -1252,7 +1225,7 @@ function bulletCharAt(s, i) {
 
 // A line looks like `<...>` alone (the `html` alternative in the setext
 // lookahead): <, 1+ characters that are not \n or >, then > at end of line.
-function htmlLookaheadLine(s, i) {
+function htmlLine(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   if (s[p] !== '<') return false;
@@ -1262,24 +1235,24 @@ function htmlLookaheadLine(s, i) {
   return s[j] === '>' && s[j + 1] === '\n';
 }
 
-function readSetext(s, st) {
+function takeSetext(s, st) {
   // The first line must not start a block construct.
-  if (lineIsBlankAt(s, 0)) return null;
-  if (bulletCharAt(s, 0) || lineIsIndentedCode(s, 0) || fenceLengthAt(s, 0) ||
-      lineIsQuote(s, 0) || lineIsAtx(s, 0) || lineIsRule(s, 0) ||
-      htmlLookaheadLine(s, 0) || isTableDelimLine(s, 0)) return null;
+  if (blankAt(s, 0)) return null;
+  if (bulletChar(s, 0) || codeLine(s, 0) || fenceAt(s, 0) ||
+      quoteLine(s, 0) || atxLine(s, 0) || hrLine(s, 0) ||
+      htmlLine(s, 0) || delimLine(s, 0)) return null;
   let lineStart = 0;
   let depth = 0, underlineEnd = -1;
   for (;;) {
-    const le = endOfLine(s, lineStart);
+    const le = lineEnd(s, lineStart);
     if (lineStart > 0) {
-      const d = setextDepthAt(s, lineStart);
+      const d = setextAt(s, lineStart);
       if (d) { depth = d; underlineEnd = le; break; }
-      if (lineIsBlankAt(s, lineStart)) return null;
-      if (bulletCharAt(s, lineStart) || fenceLengthAt(s, lineStart) ||
-          lineIsQuote(s, lineStart) || lineIsAtx(s, lineStart) ||
-          lineIsRule(s, lineStart) || htmlLookaheadLine(s, lineStart) ||
-          isTableDelimLine(s, lineStart)) return null;
+      if (blankAt(s, lineStart)) return null;
+      if (bulletChar(s, lineStart) || fenceAt(s, lineStart) ||
+          quoteLine(s, lineStart) || atxLine(s, lineStart) ||
+          hrLine(s, lineStart) || htmlLine(s, lineStart) ||
+          delimLine(s, lineStart)) return null;
     }
     if (le >= s.length) return null;
     lineStart = le + 1;
@@ -1287,24 +1260,24 @@ function readSetext(s, st) {
   }
   const raw = s.slice(0, underlineEnd);
   const text = raw.slice(0, raw.lastIndexOf('\n')).trim();
-  return { type: 'heading', raw, depth, text };
+  return { type: 'head', raw, depth, text };
 }
 
-function readTable(s, st) {
+function takeTable(s, st) {
   let p = 0;
   while (s[p] === ' ') p++;
   if (s[p] === '\n' || s[p] === undefined) return null;
-  const hEnd = endOfLine(s, p);
+  const hEnd = lineEnd(s, p);
   const headerLine = s.slice(p, hEnd);
   if (hEnd >= s.length) return null;
   let dStart = hEnd + 1, dsp = 0;
   while (dsp < 3 && s[dStart] === ' ') { dStart++; dsp++; }
-  const dEnd = endOfLine(s, dStart);
-  const delimLine = s.slice(dStart, dEnd);
-  if (!/^(?:\| *)?:?-+:? *(?:\| *:?-+:? *)*(?:\| *)?$/.test(delimLine)) return null;
-  if (!/[:|]/.test(delimLine)) return null;
-  const headerCells = splitRowCells(headerLine);
-  const delimCells = delimLine.replace(/^\||\| *$/g, '').split('|');
+  const dEnd = lineEnd(s, dStart);
+  const delim = s.slice(dStart, dEnd);
+  if (!/^(?:\| *)?:?-+:? *(?:\| *:?-+:? *)*(?:\| *)?$/.test(delim)) return null;
+  if (!/[:|]/.test(delim)) return null;
+  const headerCells = splitCells(headerLine);
+  const delimCells = delim.replace(/^\||\| *$/g, '').split('|');
   if (headerCells.length !== delimCells.length) return null;
   const align = delimCells.map((c) =>
     /^ *-+: *$/.test(c) ? 'right' : /^ *:-+: *$/.test(c) ? 'center' : /^ *:-+ *$/.test(c) ? 'left' : null);
@@ -1317,24 +1290,24 @@ function readTable(s, st) {
     let q = rStart;
     while (s[q] === ' ') q++;
     if (s[q] === '\n' || s[q] === undefined) break;
-    if (lineIsRule(s, rStart) || lineIsAtx(s, rStart) || lineIsQuote(s, rStart) ||
-        lineIsIndentedCode(s, rStart) || fenceLengthAt(s, rStart) || htmlStartsAt(s, rStart, 3, 'para')) break;
+    if (hrLine(s, rStart) || atxLine(s, rStart) || quoteLine(s, rStart) ||
+        codeLine(s, rStart) || fenceAt(s, rStart) || htmlAt(s, rStart, 3, 'para')) break;
     // List: only unordered bullets or ordered lists starting with 1.
-    if (tableRowStopsAtList(s, rStart)) break;
-    const rEnd = endOfLine(s, rStart);
+    if (tableListStop(s, rStart)) break;
+    const rEnd = lineEnd(s, rStart);
     rows.push(s.slice(rStart, rEnd));
     lastEnd = rEnd;
     rStart = rEnd < s.length ? rEnd + 1 : s.length;
   }
   const raw = s.slice(0, lastEnd);
   const header = headerCells.map((c, i) => ({ text: c, align: align[i], header: true }));
-  const body = rows.map((row) => splitRowCells(row, header.length).map((c, i) => ({ text: c, align: align[i], header: false })));
+  const body = rows.map((row) => splitCells(row, header.length).map((c, i) => ({ text: c, align: align[i], header: false })));
   return { type: 'table', raw, header, align, rows: body };
 }
 
 // A table body row stops at a line starting an unordered list item or an
 // ordered list item numbered 1 (followed by a space or tab).
-function tableRowStopsAtList(s, i) {
+function tableListStop(s, i) {
   let p = i, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
   const c = s[p];
@@ -1349,81 +1322,81 @@ function tableRowStopsAtList(s, i) {
   return false;
 }
 
-function readParagraph(s, st) {
-  const end = paragraphStop(s, 0);
+function takePara(s, st) {
+  const end = paraEnd(s, 0);
   if (end === 0) return null;
   const raw = s.slice(0, end);
-  const tok = { type: 'paragraph', raw, text: raw };
-  st.queue.push(tok);
+  const tok = { type: 'para', raw, text: raw };
+  st.jobs.push(tok);
   return tok;
 }
 
-function readText(s, st) {
-  const le = endOfLine(s, 0);
+function takeText(s, st) {
+  const le = lineEnd(s, 0);
   if (le === 0) return null;
   const raw = s.slice(0, le);
   const tok = { type: 'text', raw, text: raw };
-  st.queue.push(tok);
+  st.jobs.push(tok);
   return tok;
 }
 
 // Main block loop. `cont` means a leading paragraph merges into a
 // previous paragraph token (blockquote lazy continuation).
-function lexBlocks(src, tokens, st, cont) {
+function lex(src, tokens, st, cont) {
   let s = src;
   let guard = Infinity;
   while (s.length > 0) {
     if (s.length >= guard) throw new Error('Infinite loop on byte: ' + s.charCodeAt(0));
     guard = s.length;
     let r;
-    if ((r = readSpace(s))) {
+    if ((r = takeBlank(s))) {
       s = s.substring(r.raw.length);
       const prev = tokens[tokens.length - 1];
       if (r.raw.length === 1 && prev !== undefined) prev.raw += '\n';
       else tokens.push(r);
       continue;
     }
-    if ((r = readIndentedCode(s))) {
+    if ((r = takeIndentCode(s))) {
       s = s.substring(r.raw.length);
       const prev = tokens[tokens.length - 1];
-      if (prev && (prev.type === 'paragraph' || prev.type === 'text')) {
+      if (prev && (prev.type === 'para' || prev.type === 'text')) {
         prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + r.raw;
         prev.text += '\n' + r.text;
       } else tokens.push(r);
       continue;
     }
-    if ((r = readFence(s))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
-    if ((r = readAtx(s))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
-    if ((r = readRule(s))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
-    if ((r = readQuote(s, st))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
-    if ((r = readList(s, st))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
-    if ((r = readHtmlBlock(s))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
-    if ((r = readDef(s, st))) {
+    if ((r = takeFence(s))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
+    if ((r = takeAtx(s))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
+    if ((r = takeHr(s))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
+    if ((r = takeQuote(s, st))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
+    if ((r = takeList(s, st))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
+    if ((r = takeHtml(s))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
+    if ((r = takeDef(s, st))) {
       s = s.substring(r.raw.length);
       const prev = tokens[tokens.length - 1];
-      if (prev && (prev.type === 'paragraph' || prev.type === 'text')) {
+      if (prev && (prev.type === 'para' || prev.type === 'text')) {
         prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + r.raw;
         prev.text += '\n' + r.raw;
       } else {
-        if (!Object.hasOwn(st.links, r.tag)) st.links[r.tag] = { href: r.href, title: r.title };
+        if (!Object.hasOwn(st.defs, r.tag)) st.defs[r.tag] = { href: r.href, title: r.title };
         tokens.push(r);
       }
       continue;
     }
-    if ((r = readTable(s, st))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
-    if ((r = readSetext(s, st))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
-    if (st.top && (r = readParagraph(s, st))) {
+    if ((r = takeTable(s, st))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
+    if ((r = takeSetext(s, st))) { s = s.substring(r.raw.length); tokens.push(r); continue; }
+    if (st.top && (r = takePara(s, st))) {
       const prev = tokens[tokens.length - 1];
-      if (cont && prev && prev.type === 'paragraph') {
+      if (cont && prev && prev.type === 'para') {
         prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + r.raw;
         prev.text += '\n' + r.text;
-        st.queue.pop();
+        st.jobs.pop();
       } else tokens.push(r);
       cont = false;
       s = s.substring(r.raw.length);
       continue;
     }
-    if ((r = readText(s, st))) {
+    if ((r = takeText(s, st))) {
       s = s.substring(r.raw.length);
       const prev = tokens[tokens.length - 1];
       if (prev && prev.type === 'text') {
@@ -1442,26 +1415,25 @@ function lexBlocks(src, tokens, st, cont) {
 
 const PUNCT_RE = /[\p{P}\p{S}]/u;
 const EMAIL_START_RE = /[A-Za-z0-9._+-]+@/y;
-const ALNUM_RE = /[\p{L}\p{N}]/u;
-function isPunctCh(c) { return c !== '' && PUNCT_RE.test(c); }
-function isWSCh(c) {
+function punctCh(c) { return c !== '' && PUNCT_RE.test(c); }
+function wsCh(c) {
   if (c === '' || c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v') return true;
   if (!c) return false;
   const code = c.charCodeAt(0);
   return code === 0x00a0 || code === 0x1680 || (code >= 0x2000 && code <= 0x200a) ||
     code === 0x202f || code === 0x205f || code === 0x3000;
 }
-function isWordishCh(c) { return c !== '' && !isWSCh(c) && !isPunctCh(c); }
-function canOpenDelim(prev, next) {
-  return !isWSCh(next) && (!isPunctCh(next) || isWSCh(prev) || isPunctCh(prev));
+function wordCh(c) { return c !== '' && !wsCh(c) && !punctCh(c); }
+function mayOpen(prev, next) {
+  return !wsCh(next) && (!punctCh(next) || wsCh(prev) || punctCh(prev));
 }
-function canCloseDelim(prev, next) {
-  return !isWSCh(prev) && (!isPunctCh(prev) || isWSCh(next) || isPunctCh(next));
+function mayClose(prev, next) {
+  return !wsCh(prev) && (!punctCh(prev) || wsCh(next) || punctCh(next));
 }
 
 // End of a code span starting at src[i] (a run of `n` backticks): the
 // index just past the matching run, or -1.
-function codeSpanClose(src, i, n) {
+function codeClose(src, i, n) {
   let j = i + n;
   for (;;) {
     const k = src.indexOf('`', j);
@@ -1476,7 +1448,7 @@ function codeSpanClose(src, i, n) {
 // Index of the `]` that closes a link label starting at src[i] (i points
 // just past the opening `[`). Handles nesting, code spans and backslash
 // escapes. Returns -1 when there is none.
-function labelCloseAt(src, i) {
+function labelEnd(src, i) {
   let depth = 0, j = i;
   while (j < src.length) {
     const c = src[j];
@@ -1517,11 +1489,11 @@ function labelCloseAt(src, i) {
   return -1;
 }
 
-// Lenient label end: like labelCloseAt, but a code span that never
+// Lenient label end: like labelEnd, but a code span that never
 // closes does not fail the scan — its backticks are just skipped.
 // Used to find the extent of a `[label]` whose label regex failed, so
-// emphasis inside it can be suppressed (see scanInlineNodes).
-function labelCloseLenient(src, i) {
+// emphasis inside it can be suppressed (see scanInline).
+function labelEndLoose(src, i) {
   let depth = 0, j = i;
   while (j < src.length) {
     const c = src[j];
@@ -1561,7 +1533,7 @@ function labelCloseLenient(src, i) {
 
 // Parse the `(...)` part of an inline link, starting just past the `(`.
 // Returns {href, title, end} (end is just past the closing `)`) or null.
-function readLinkTarget(src, i) {
+function linkTarget(src, i) {
   let j = i;
   while (src[j] === ' ' || src[j] === '\t' || src[j] === '\n') j++;
   let href;
@@ -1604,7 +1576,7 @@ function readLinkTarget(src, i) {
     let q = t;
     while (src[q] === ' ' || src[q] === '\t' || src[q] === '\n') q++;
     if (q !== t) {
-      const tp = parseTitle(src, q);
+      const tp = titleAt(src, q);
       if (tp) { title = tp.title; t = tp.end; }
     }
   }
@@ -1616,18 +1588,18 @@ function readLinkTarget(src, i) {
 
 // Does a link label contain a tag/autolink that starts inside the label
 // but ends outside it (which invalidates the link)?
-function labelStraddlesTag(src, labelStart, label) {
+function labelCrossesTag(src, labelStart, label) {
   if (label.indexOf('<') === -1) return false;
   for (let s = 0; s < label.length; s++) {
     if (label[s] === '\\') { s++; continue; }
     if (label[s] === '`') {
-      const end = codeSpanClose(label, s, (() => { let m = s; while (label[m] === '`') m++; return m - s; })());
+      const end = codeClose(label, s, (() => { let m = s; while (label[m] === '`') m++; return m - s; })());
       if (end !== -1) { s = end - 1; continue; }
     }
     if (label[s] !== '<') continue;
     const r = src.slice(labelStart + s);
-    let o = parseInlineTag(r, 0);
-    if (o === -1) { const al = autolinkAt(r, 0); o = al === -1 ? -1 : al.end; }
+    let o = inlineTagEnd(r, 0);
+    if (o === -1) { const al = autoLink(r, 0); o = al === -1 ? -1 : al.end; }
     if (o !== -1 && o > label.length - s) return true;
     if (o !== -1) s += o - 1;
   }
@@ -1636,15 +1608,15 @@ function labelStraddlesTag(src, labelStart, label) {
 
 // Match `<scheme:...>` or `<email>` at src[i] === '<'. Returns the end
 // index or -1.
-function autolinkAt(src, i) {
+function autoLink(src, i) {
   // scheme: [a-zA-Z][a-zA-Z0-9+.-]{1,31} : [^\s\x00-\x1f<>]*
   let j = i + 1;
-  if (!isAlphaChar(src.charCodeAt(j))) return -1;
+  if (!alphaChar(src.charCodeAt(j))) return -1;
   j++;
   let n = 0;
   while (j < src.length) {
     const c = src.charCodeAt(j);
-    if (isAlnumCode(c) || src[j] === '+' || src[j] === '.' || src[j] === '-') { j++; n++; }
+    if (alnumCode(c) || src[j] === '+' || src[j] === '.' || src[j] === '-') { j++; n++; }
     else break;
   }
   if (n >= 1 && n <= 31 && src[j] === ':') {
@@ -1666,7 +1638,7 @@ function autolinkAt(src, i) {
 
 // Trim a GFM extended autolink the way marked's _backpedal does: drop
 // trailing punctuation and unbalanced closing parens.
-function trimUrlTail(u) {
+function trimTail(u) {
   for (;;) {
     const before = u;
     // Scan the backpedal pattern from the start; take its length.
@@ -1704,7 +1676,7 @@ function trimUrlTail(u) {
 
 // Match a GFM extended autolink at src[i]: www., http(s)://, ftp://,
 // mailto:/xmpp: email, or a bare email. Returns {end, text, href} or null.
-function extendedAutolinkAt(src, i, prevCh) {
+function extLink(src, i, prevCh) {
   const rest = src.slice(i);
   // mailto: / xmpp: email
   let m = /^(?:mailto|xmpp):[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+/.exec(rest);
@@ -1719,7 +1691,7 @@ function extendedAutolinkAt(src, i, prevCh) {
   // scheme:// or www.
   m = /^(?:(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*/.exec(rest);
   if (m) {
-    let u = trimUrlTail(m[0]);
+    let u = trimTail(m[0]);
     if (u.length === 0) return null;
     const href = m[0].startsWith('www.') ? 'http://' + u : u;
     return { end: i + u.length, text: u, href };
@@ -1730,24 +1702,16 @@ function extendedAutolinkAt(src, i, prevCh) {
   return null;
 }
 
-// Whether a GFM extended autolink may start at position i (the preceding
-// character must be whitespace, *, _, ~, ( or the start of the string).
-function urlMayStart(src, i) {
-  if (i === 0) return true;
-  const c = src[i - 1];
-  return c === ' ' || c === '\t' || c === '\n' || c === '*' || c === '_' || c === '~' || c === '(';
-}
-
 // ============================ INLINE SCANNER ============================
 //
-// Node kinds from scanInlineNodes:
-//  {t:'x', s}                  text (already HTML-escaped / entity-decoded)
+// Node kinds from scanInline:
+//  {t:'t', s}                  text (already HTML-escaped / entity-decoded)
 //  {t:'d', c, n, open, close}  delimiter run ('*', '_' or '~')
 //  {t:'c', s}                  code span (raw content; escaped at render)
 //  {t:'l', href, title, img, kids, auto}  link or image (href pre-escaped)
 //  {t:'h', s}                  raw HTML tag
-//  {t:'b'}                     hard break
-//  {t:'e'|'s'|'g', kids}       em / strong / del (built by resolveEmphasis)
+//  {t:'n'}                     hard break
+//  {t:'e'|'s'|'g', kids}       em / strong / del (built by resolveDelims)
 //  {t:'p', kids}               plain group (a link whose href cannot be cleaned)
 
 // Is there a non-whitespace character at or after src[i]?
@@ -1786,41 +1750,41 @@ function startsWithCI(src, j, prefix) {
 // ftp://) linkify whatever precedes them; www. needs whitespace / * _ ~ (
 // / start; mailto:/xmpp: need a non-alphanumeric before them; a bare
 // email's local part must start here (the preceding char must not be an
-// email character). extendedAutolinkAt does the real validation.
+// email character). extLink does the real validation.
 // `mayEmail` is false when the scanned string holds no '@' at all, which
 // rules out the bare-email branch without a regex test per word.
-function extendedUrlStartsHere(src, j, mayEmail) {
+function extUrlStartsHere(src, j, mayEmail) {
   const c = src[j];
   const prev = j === 0 ? '' : src[j - 1];
   if ((c === 'h' || c === 'H') && (startsWithCI(src, j, 'http://') || startsWithCI(src, j, 'https://'))) {
-    return extendedAutolinkAt(src, j, prev) !== null;
+    return extLink(src, j, prev) !== null;
   }
   if ((c === 'f' || c === 'F') && startsWithCI(src, j, 'ftp://')) {
-    return extendedAutolinkAt(src, j, prev) !== null;
+    return extLink(src, j, prev) !== null;
   }
   if (c === 'w' && src.startsWith('www.', j) &&
       (j === 0 || prev === ' ' || prev === '\t' || prev === '\n' || prev === '*' || prev === '_' || prev === '~' || prev === '(')) {
-    return extendedAutolinkAt(src, j, prev) !== null;
+    return extLink(src, j, prev) !== null;
   }
   if (((c === 'm' && src.startsWith('mailto:', j)) || (c === 'x' && src.startsWith('xmpp:', j))) &&
       (j === 0 || !isAlnumCh(prev))) {
-    return extendedAutolinkAt(src, j, prev) !== null;
+    return extLink(src, j, prev) !== null;
   }
   // Otherwise the character may start a bare email's local part.
   // (A sticky native regex replaces the per-char JS loop here.)
   if (mayEmail && isEmailLocalCh(c) && (j === 0 || !isEmailLocalCh(prev))) {
     EMAIL_START_RE.lastIndex = j;
-    if (EMAIL_START_RE.test(src)) return extendedAutolinkAt(src, j, prev) !== null;
+    if (EMAIL_START_RE.test(src)) return extLink(src, j, prev) !== null;
   }
   return false;
 }
 
 // End of the plain-text run starting at src[i]: the first position where a
 // non-text construct may start. Inside a raw span only `\` and `<` count.
-function textRunStop(src, i, st, mayEmail) {
+function textStop(src, i, st, mayEmail) {
   const n = src.length;
   let j = i;
-  if (st.inRawBlock) {
+  if (st.inRaw) {
     while (j < n) {
       const c = src[j];
       if (c === '\\' || c === '<') break;
@@ -1828,7 +1792,7 @@ function textRunStop(src, i, st, mayEmail) {
     }
     return j;
   }
-  const noLink = !st.inLink;
+  const noLink = !st.inA;
   while (j < n) {
     const c = src[j];
     if (c === '\\' || c === '<') break;
@@ -1841,7 +1805,7 @@ function textRunStop(src, i, st, mayEmail) {
     }
     if (noLink && (c === 'h' || c === 'H' || c === 'f' || c === 'F' || c === 'w' || c === 'm' || c === 'x' ||
         (mayEmail && isEmailLocalCh(c) && (j === 0 || !isEmailLocalCh(src[j - 1])))) &&
-        extendedUrlStartsHere(src, j, mayEmail)) break;
+        extUrlStartsHere(src, j, mayEmail)) break;
     j++;
   }
   return j;
@@ -1854,8 +1818,8 @@ function textRunStop(src, i, st, mayEmail) {
 // closing run breaks the effect ([less `` a ` b ``](w) does not
 // suppress, but [a ``b`](u) does). A matched pair ([a ``b``](u)) or an
 // unclosed run ([a x``y](u)) does not qualify. Such a link suppresses
-// emphasis delimiters that follow it (see suppressBadTickEmphasis).
-function labelHasMismatchedTicks(label) {
+// emphasis delimiters that follow it (see suppressBadTick).
+function badTicks(label) {
   const runs = [];
   let i = 0;
   while (i < label.length) {
@@ -1878,68 +1842,67 @@ function labelHasMismatchedTicks(label) {
 // Returns {node, end} or null. The label is parsed inline (with its own
 // emphasis resolution); a nested link inside the label invalidates an
 // outer link (but not an outer image).
-function attemptLink(src, i, st, linkParenPossible) {
+function tryLink(src, i, st, parenOk) {
   const isImage = src[i] === '!';
   const labelStart = i + (isImage ? 2 : 1);
-  const labelEnd = labelCloseAt(src, labelStart);
-  if (labelEnd === -1) return null;
-  const label = src.slice(labelStart, labelEnd);
-  if (labelStraddlesTag(src, labelStart, label)) return null;
-  let after = labelEnd + 1;
+  const labelEndIdx = labelEnd(src, labelStart);
+  if (labelEndIdx === -1) return null;
+  const label = src.slice(labelStart, labelEndIdx);
+  if (labelCrossesTag(src, labelStart, label)) return null;
+  let after = labelEndIdx + 1;
   let href, title;
-  if (src[after] === '(' && linkParenPossible) {
-    const dest = readLinkTarget(src, after + 1);
+  if (src[after] === '(' && parenOk) {
+    const dest = linkTarget(src, after + 1);
     if (dest) {
-      href = unescapePunct(dest.href);
-      title = dest.title === undefined ? undefined : unescapePunct(dest.title);
+      href = unesc(dest.href);
+      title = dest.title === undefined ? undefined : unesc(dest.title);
       after = dest.end;
     } else {
       // Not a valid inline link: fall back to a shortcut reference.
-      const def = st.links[normalizeLabel(label)];
+      const def = st.defs[foldLabel(label)];
       if (!def) return null;
       href = def.href;
       title = def.title;
     }
   } else if (src[after] === '[') {
-    const refEnd = labelCloseAt(src, after + 1);
+    const refEnd = labelEnd(src, after + 1);
     if (refEnd === -1) return null;
     const ref = src.slice(after + 1, refEnd);
-    const def = st.links[normalizeLabel(ref.length === 0 ? label : ref)];
+    const def = st.defs[foldLabel(ref.length === 0 ? label : ref)];
     if (!def) return null;
-    href = def.href; // already unescaped by readDef
+    href = def.href; // already unescaped by takeDef
     title = def.title;
     after = refEnd + 1;
   } else {
-    const def = st.links[normalizeLabel(label)];
+    const def = st.defs[foldLabel(label)];
     if (!def) return null;
     href = def.href;
     title = def.title;
   }
-  const savedInLink = st.inLink, savedInRaw = st.inRawBlock;
-  st.inLink = true; // no bare-URL linkification inside a link label
-  const kids = scanInlineNodes(label, st, linkParenPossible && label.indexOf(')') !== -1);
+  const savedInA = st.inA, savedInRaw = st.inRaw;
+  st.inA = true; // no bare-URL linkification inside a link label
+  const kids = scanInline(label, st, parenOk && label.indexOf(')') !== -1);
   const hasLink = kids.some((k) => k.t === 'l' && !k.img && !k.auto);
-  st.inLink = savedInLink;
-  st.inRawBlock = savedInRaw;
+  st.inA = savedInA;
+  st.inRaw = savedInRaw;
   if (!isImage && hasLink) return null;
-  resolveEmphasis(kids);
-  unlinkTrailingEmail(kids);
-  const clean = normalizeHref(href);
+  resolveDelims(kids);
+  unlinkEmail(kids);
+  const clean = cleanHref(href);
   if (clean === null) return { node: { t: 'p', kids }, end: after };
   return {
     node: {
       t: 'l',
-      href: escapeHtml(clean, false),
+      href: esc(clean, false),
       title,
       img: isImage,
       kids,
       auto: false,
-      badTick: labelHasMismatchedTicks(label),
+      badTick: badTicks(label),
     },
     end: after,
   };
 }
-
 // Fast path for inline strings with no inline constructs at all: no
 // backslash, tag, code span, link bracket, delimiter run, image start,
 // two-space hard break, or anything that could linkify (www., a scheme
@@ -1947,18 +1910,18 @@ function attemptLink(src, i, st, linkParenPossible) {
 // plain escaped text — or verbatim inside a raw span — without the
 // scanner. The guards are supersets of the real constructs, so a false
 // positive only costs speed, never correctness.
-const FAST_PLAIN = /[\\<`\[*_~]|!\[|  +\n|www\.|https?:\/\/|ftp:\/\/|mailto:|xmpp:|\S+@\S/i;
-function plainInlineHtml(text, st) {
-  if (FAST_PLAIN.test(text)) return null;
-  if (st.inRawBlock) return text;
-  return /[&<>"']/.test(text) ? escapeHtml(decodeNumericEntities(text), false) : text;
+const PLAIN_GUARD = /[\\<`\[*_~]|!\[|  +\n|www\.|https?:\/\/|ftp:\/\/|mailto:|xmpp:|\S+@\S/i;
+function plainHtml(text, st) {
+  if (PLAIN_GUARD.test(text)) return null;
+  if (st.inRaw) return text;
+  return /[&<>"']/.test(text) ? esc(decodeNums(text), false) : text;
 }
 
 // Phase A: scan inline content into a flat node list (delimiter runs left
-// unresolved for resolveEmphasis). `st` carries inLink / inRawBlock.
-function scanInlineNodes(src, st, linkParenPossible) {
-  const plain = plainInlineHtml(src, st);
-  if (plain !== null) return [{ t: 'x', s: plain }];
+// unresolved for resolveDelims). `st` carries inA / inRaw.
+function scanInline(src, st, parenOk) {
+  const plain = plainHtml(src, st);
+  if (plain !== null) return [{ t: 't', s: plain }];
   const nodes = [];
   const n = src.length;
   let i = 0;
@@ -1970,7 +1933,7 @@ function scanInlineNodes(src, st, linkParenPossible) {
   let r = ''; // last char of the previous text token ('' when it was not text)
   const flush = () => {
     if (buf.length === 0) return;
-    nodes.push({ t: 'x', s: buf });
+    nodes.push({ t: 't', s: buf });
     if (buf.charCodeAt(buf.length - 1) !== 95) r = buf[buf.length - 1]; // 95 = '_'
     buf = '';
   };
@@ -1979,26 +1942,26 @@ function scanInlineNodes(src, st, linkParenPossible) {
   // or verbatim inside a raw span.
   const pushRaw = (run) => {
     if (run.length === 0) return;
-    if (st.inRawBlock) { buf += run; return; }
-    if (/[&<>"']/.test(run)) buf += escapeHtml(decodeNumericEntities(run), false);
+    if (st.inRaw) { buf += run; return; }
+    if (/[&<>"']/.test(run)) buf += esc(decodeNums(run), false);
     else buf += run;
   };
   // Append one backslash-escaped character as finished text.
   const pushEsc = (ch) => {
-    if (st.inRawBlock) { buf += ch; return; }
+    if (st.inRaw) { buf += ch; return; }
     buf += ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : ch === "'" ? '&#39;' : ch;
   };
   while (i < n) {
     const c = src[i];
     // backslash escape (also inside raw spans)
-    if (c === '\\' && i + 1 < n && ESCAPABLE.has(src[i + 1])) {
+    if (c === '\\' && i + 1 < n && ESCAPES.has(src[i + 1])) {
       pushEsc(src[i + 1]);
       i += 2;
       continue;
     }
     // hard break: backslash + newline, when content follows it
-    if (!st.inRawBlock && c === '\\' && src[i + 1] === '\n' && hasNonWS(src, i + 2)) {
-      emit({ t: 'b' });
+    if (!st.inRaw && c === '\\' && src[i + 1] === '\n' && hasNonWS(src, i + 2)) {
+      emit({ t: 'n' });
       i += 2;
       while (src[i] === ' ' || src[i] === '\t') i++; // leading indent is dropped
       continue;
@@ -2006,11 +1969,11 @@ function scanInlineNodes(src, st, linkParenPossible) {
     // a backslash that is neither an escape nor a hard break is literal
     if (c === '\\') { buf += '\\'; i++; continue; }
     // hard break: 2+ spaces + newline, when content follows it
-    if (!st.inRawBlock && c === ' ') {
+    if (!st.inRaw && c === ' ') {
       let k = i;
       while (src[k] === ' ') k++;
       if (k - i >= 2 && src[k] === '\n' && hasNonWS(src, k + 1)) {
-        emit({ t: 'b' });
+        emit({ t: 'n' });
         i = k + 1;
         while (src[i] === ' ' || src[i] === '\t') i++; // leading indent is dropped
         continue;
@@ -2018,23 +1981,23 @@ function scanInlineNodes(src, st, linkParenPossible) {
     }
     // tag (also inside raw spans) / autolink
     if (c === '<') {
-      const tagEnd = parseInlineTag(src, i);
+      const tagEnd = inlineTagEnd(src, i);
       if (tagEnd !== -1) {
         const tag = src.slice(i, tagEnd);
-        if (!st.inLink && /^<a /i.test(tag)) st.inLink = true;
-        else if (st.inLink && /^<\/a\s*>/i.test(tag)) st.inLink = false;
-        if (!st.inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(tag)) st.inRawBlock = true;
-        else if (st.inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(tag)) st.inRawBlock = false;
+        if (!st.inA && /^<a /i.test(tag)) st.inA = true;
+        else if (st.inA && /^<\/a\s*>/i.test(tag)) st.inA = false;
+        if (!st.inRaw && /^<(pre|code|kbd|script)(\s|>)/i.test(tag)) st.inRaw = true;
+        else if (st.inRaw && /^<\/(pre|code|kbd|script)(\s|>)/i.test(tag)) st.inRaw = false;
         emit({ t: 'h', s: tag });
         i = tagEnd;
         continue;
       }
-      if (!st.inRawBlock) {
-        const al = autolinkAt(src, i);
+      if (!st.inRaw) {
+        const al = autoLink(src, i);
         if (al !== -1) {
-          const href = normalizeHref(al.href);
+          const href = cleanHref(al.href);
           if (href !== null) {
-            emit({ t: 'l', href: escapeHtml(href, true), title: undefined, img: false, kids: [{ t: 'x', s: escapeHtml(al.text, false) }], auto: true });
+            emit({ t: 'l', href: esc(href, true), title: undefined, img: false, kids: [{ t: 't', s: esc(al.text, false) }], auto: true });
           } else {
             pushRaw(al.text);
           }
@@ -2042,19 +2005,19 @@ function scanInlineNodes(src, st, linkParenPossible) {
           continue;
         }
       }
-      if (st.inRawBlock) buf += '<'; else buf += '&lt;';
+      if (st.inRaw) buf += '<'; else buf += '&lt;';
       i++;
       continue;
     }
-    if (st.inRawBlock) {
-      const j = textRunStop(src, i, st, mayEmail);
+    if (st.inRaw) {
+      const j = textStop(src, i, st, mayEmail);
       pushRaw(src.slice(i, j));
       i = j;
       continue;
     }
     // link / image
     if (c === '[' || (c === '!' && src[i + 1] === '[')) {
-      const link = attemptLink(src, i, st, linkParenPossible);
+      const link = tryLink(src, i, st, parenOk);
       if (link) {
         emit(link.node);
         i = link.end;
@@ -2066,8 +2029,8 @@ function scanInlineNodes(src, st, linkParenPossible) {
       // ('(' or '[' follows the label), the label's emphasis
       // delimiters are literal text — but only then; a bare '[label]'
       // with no dest still resolves its emphasis.
-      if (labelCloseAt(src, i + 1) === -1) {
-        const le = labelCloseLenient(src, i + 1);
+      if (labelEnd(src, i + 1) === -1) {
+        const le = labelEndLoose(src, i + 1);
         if (le !== -1 && (src[le + 1] === '(' || src[le + 1] === '[')) {
           if (le > suppressUntil) suppressUntil = le;
         }
@@ -2081,7 +2044,7 @@ function scanInlineNodes(src, st, linkParenPossible) {
       let m = i;
       while (src[m] === '`') m++;
       const runLen = m - i;
-      const end = codeSpanClose(src, i, runLen);
+      const end = codeClose(src, i, runLen);
       if (end !== -1) {
         let content = src.slice(i + runLen, end - runLen).replace(/\n/g, ' ');
         if (content.length >= 2 && content[0] === ' ' && content[content.length - 1] === ' ' && /[^ ]/.test(content)) content = content.slice(1, -1);
@@ -2116,23 +2079,23 @@ function scanInlineNodes(src, st, linkParenPossible) {
       const prevClose = i > 0 ? src[i - 1] : '';
       let open, close;
       if (c === '_') {
-        open = canOpenDelim(prevOpen, next) && !(isWordishCh(next) && isWordishCh(prevOpen));
-        close = canCloseDelim(prevClose, next) && !(isWordishCh(prevClose) && isWordishCh(next));
+        open = mayOpen(prevOpen, next) && !(wordCh(next) && wordCh(prevOpen));
+        close = mayClose(prevClose, next) && !(wordCh(prevClose) && wordCh(next));
       } else {
-        open = canOpenDelim(prevOpen, next);
-        close = canCloseDelim(prevClose, next);
+        open = mayOpen(prevOpen, next);
+        close = mayClose(prevClose, next);
       }
       emit({ t: 'd', c, n: runLen, open, close, prev: i > 0 ? src[i - 1] : '', next: src[m] || '' });
       i = m;
       continue;
     }
     // GFM extended autolink (www. / http(s):// / ftp:// / email)
-    if (!st.inLink && extendedUrlStartsHere(src, i, mayEmail)) {
-      const u = extendedAutolinkAt(src, i, src[i - 1]);
+    if (!st.inA && extUrlStartsHere(src, i, mayEmail)) {
+      const u = extLink(src, i, src[i - 1]);
       if (u) {
-        const href = normalizeHref(u.href);
+        const href = cleanHref(u.href);
         if (href !== null) {
-          emit({ t: 'l', href: escapeHtml(href, true), title: undefined, img: false, kids: [{ t: 'x', s: escapeHtml(u.text, false) }], auto: true });
+          emit({ t: 'l', href: esc(href, true), title: undefined, img: false, kids: [{ t: 't', s: esc(u.text, false) }], auto: true });
         } else {
           pushRaw(u.text);
         }
@@ -2141,7 +2104,7 @@ function scanInlineNodes(src, st, linkParenPossible) {
       }
     }
     // plain text run
-    const j = textRunStop(src, i, st, mayEmail);
+    const j = textStop(src, i, st, mayEmail);
     if (j === i) { pushRaw(src[i]); i++; continue; } // safety: never stall
     pushRaw(src.slice(i, j));
     i = j;
@@ -2150,7 +2113,7 @@ function scanInlineNodes(src, st, linkParenPossible) {
   return nodes;
 }
 
-// Phase B: resolve delimiter runs in `nodes` (flat, from scanInlineNodes)
+// Phase B: resolve delimiter runs in `nodes` (flat, from scanInline)
 // into <em>/<strong>/<del> nodes, mutating `nodes` in place. Opener-driven
 // forward scan: each opener looks forward for its closer, absorbing
 // opener-only runs of the same character into the length it needs and
@@ -2163,16 +2126,12 @@ function scanInlineNodes(src, st, linkParenPossible) {
 // including leftover delimiters from either run — is resolved recursively.
 // A closer's delimiters not consumed by the match stay behind as a fresh
 // delimiter run to be resolved in turn.
-function resolveEmphasis(nodes) {
-  resolveDelimiters(nodes);
-}
-
-function resolveDelimiters(nodes) {
+function resolveDelims(nodes) {
   let i = 0;
   while (i < nodes.length) {
     const node = nodes[i];
     if (node.t !== 'd' || node.n === 0 || !node.open) {
-      if (node.t === 'd') nodes[i] = { t: 'x', s: node.c.repeat(node.n) };
+      if (node.t === 'd') nodes[i] = { t: 't', s: node.c.repeat(node.n) };
       i++;
       continue;
     }
@@ -2181,12 +2140,12 @@ function resolveDelimiters(nodes) {
     let matched = null, effLen = node.n;
     const minLen = node.c === '~' ? node.n : 1;
     while (effLen >= minLen) {
-      const m = findMatchingCloser(nodes, i, effLen);
+      const m = findCloser(nodes, i, effLen);
       if (m) { matched = m; break; }
       effLen--;
     }
     if (!matched) {
-      nodes[i] = { t: 'x', s: node.c.repeat(node.n) };
+      nodes[i] = { t: 't', s: node.c.repeat(node.n) };
       i++;
       continue;
     }
@@ -2202,9 +2161,9 @@ function resolveDelimiters(nodes) {
     if (effLen > use) content.push({ t: 'd', c: node.c, n: effLen - use, open: node.open, close: node.close, prev: node.prev, next: node.next });
     for (let k = i + 1; k < closerIdx; k++) content.push(nodes[k]);
     if (closerUsed > use) content.push({ t: 'd', c: closer.c, n: closerUsed - use, open: closer.open, close: closer.close, prev: closer.prev, next: closer.next });
-    resolveDelimiters(content);
+    resolveDelims(content);
     const seg = [];
-    if (litBefore > 0) seg.push({ t: 'x', s: node.c.repeat(litBefore) });
+    if (litBefore > 0) seg.push({ t: 't', s: node.c.repeat(litBefore) });
     seg.push({ t: kind, kids: content });
     const closerLeft = closer.n - closerUsed;
     if (closerLeft > 0) seg.push({ t: 'd', c: closer.c, n: closerLeft, open: closer.open, close: closer.close, prev: closer.prev, next: closer.next });
@@ -2220,13 +2179,13 @@ function resolveDelimiters(nodes) {
 // punctuation) or (prev is not-punctuation-not-space and next is
 // not-punctuation-not-space). Falls back to the flanking flags when the
 // adjacent characters were not recorded.
-function delimIsBoth(d) {
+function delimBoth(d) {
   if (d.prev === undefined || d.next === undefined) return !!(d.open && d.close);
   const prev = d.prev, next = d.next;
-  const prevP = prev !== '' && prev !== d.c && isPunctCh(prev);
-  const nextP = next !== '' && next !== d.c && isPunctCh(next);
-  const prevN = prev !== '' && prev !== d.c && !isPunctCh(prev) && !isWSCh(prev);
-  const nextN = next !== '' && next !== d.c && !isPunctCh(next) && !isWSCh(next);
+  const prevP = prev !== '' && prev !== d.c && punctCh(prev);
+  const nextP = next !== '' && next !== d.c && punctCh(next);
+  const prevN = prev !== '' && prev !== d.c && !punctCh(prev) && !wsCh(prev);
+  const nextN = next !== '' && next !== d.c && !punctCh(next) && !wsCh(next);
   return (prevP && nextP) || (prevN && nextN);
 }
 
@@ -2234,7 +2193,7 @@ function delimIsBoth(d) {
 // length is effLen, scanning forward. Returns {closerIdx, use, closerUsed}
 // or null. `closerUsed` is how many of the closer run's delimiters the
 // match consumes (the rest stay behind as a fresh run).
-function findMatchingCloser(nodes, oi, effLen) {
+function findCloser(nodes, oi, effLen) {
   const op = nodes[oi];
   const c = op.c;
   if (c === '~') {
@@ -2276,7 +2235,7 @@ function findMatchingCloser(nodes, oi, effLen) {
     if (d.c !== c) continue;
     if (d.open && !d.close) { need += d.n; continue; }
     if (!d.close) continue;
-    const eitherBoth = delimIsBoth(op) || delimIsBoth(d);
+    const eitherBoth = delimBoth(op) || delimBoth(d);
     if (eitherBoth && (effLen + d.n) % 3 === 0 && !(effLen % 3 === 0 && d.n % 3 === 0)) {
       free += d.n;
       continue;
@@ -2300,58 +2259,58 @@ function findMatchingCloser(nodes, oi, effLen) {
 // consumed — so only unlink when the following '_' / '-' survived
 // emphasis resolution as literal text. Unlinking renders the link's
 // text with no <a> tag (a plain group).
-function unlinkTrailingEmail(nodes) {
+function unlinkEmail(nodes) {
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
     if (n.t === 'l' && n.auto && typeof n.href === 'string' && n.href.startsWith('mailto:')) {
       const next = nodes[i + 1];
-      if (next && next.t === 'x' && (next.s.charCodeAt(0) === 95 || next.s.charCodeAt(0) === 45)) {
+      if (next && next.t === 't' && (next.s.charCodeAt(0) === 95 || next.s.charCodeAt(0) === 45)) {
         nodes[i] = { t: 'p', kids: n.kids };
       }
     } else if ((n.t === 'e' || n.t === 's' || n.t === 'g' || n.t === 'l' || n.t === 'p') && n.kids) {
-      unlinkTrailingEmail(n.kids);
+      unlinkEmail(n.kids);
     }
   }
 }
 
 // Plain-text rendering of a node list (for image alt text): links and
 // emphasis contribute their inner text, code spans their content.
-function textContent(nodes) {
+function plainText(nodes) {
   let out = '';
   for (const node of nodes) {
-    if (node.t === 'x') out += node.s;
-    else if (node.t === 'c') out += escapeHtml(node.s, true);
+    if (node.t === 't') out += node.s;
+    else if (node.t === 'c') out += esc(node.s, true);
     else if (node.t === 'h') out += node.s;
-    else if (node.t === 'b') out += '\n';
+    else if (node.t === 'n') out += '\n';
     else if (node.t === 'd') out += node.c.repeat(node.n);
-    else if (node.t === 'e' || node.t === 's' || node.t === 'g' || node.t === 'p') out += textContent(node.kids);
-    else if (node.t === 'l') out += textContent(node.kids);
+    else if (node.t === 'e' || node.t === 's' || node.t === 'g' || node.t === 'p') out += plainText(node.kids);
+    else if (node.t === 'l') out += plainText(node.kids);
   }
   return out;
 }
 
 // Render a resolved inline node list to HTML.
-function renderInlineNodes(nodes) {
+function renderInline(nodes) {
   let out = '';
   for (const node of nodes) {
-    if (node.t === 'x') out += node.s;
-    else if (node.t === 'c') out += '<code>' + escapeHtml(node.s, true) + '</code>';
+    if (node.t === 't') out += node.s;
+    else if (node.t === 'c') out += '<code>' + esc(node.s, true) + '</code>';
     else if (node.t === 'h') out += node.s;
-    else if (node.t === 'b') out += '<br>';
+    else if (node.t === 'n') out += '<br>';
     else if (node.t === 'd') out += node.c.repeat(node.n);
-    else if (node.t === 'e') out += '<em>' + renderInlineNodes(node.kids) + '</em>';
-    else if (node.t === 's') out += '<strong>' + renderInlineNodes(node.kids) + '</strong>';
-    else if (node.t === 'g') out += '<del>' + renderInlineNodes(node.kids) + '</del>';
-    else if (node.t === 'p') out += renderInlineNodes(node.kids);
+    else if (node.t === 'e') out += '<em>' + renderInline(node.kids) + '</em>';
+    else if (node.t === 's') out += '<strong>' + renderInline(node.kids) + '</strong>';
+    else if (node.t === 'g') out += '<del>' + renderInline(node.kids) + '</del>';
+    else if (node.t === 'p') out += renderInline(node.kids);
     else if (node.t === 'l') {
       if (node.img) {
-        let tag = '<img src="' + node.href + '" alt="' + textContent(node.kids) + '"';
-        if (node.title !== undefined) tag += ' title="' + escapeHtml(node.title, false) + '"';
+        let tag = '<img src="' + node.href + '" alt="' + plainText(node.kids) + '"';
+        if (node.title !== undefined) tag += ' title="' + esc(node.title, false) + '"';
         out += tag + '>';
       } else {
         let tag = '<a href="' + node.href + '"';
-        if (node.title !== undefined) tag += ' title="' + escapeHtml(node.title, false) + '"';
-        out += tag + '>' + renderInlineNodes(node.kids) + '</a>';
+        if (node.title !== undefined) tag += ' title="' + esc(node.title, false) + '"';
+        out += tag + '>' + renderInline(node.kids) + '</a>';
       }
     }
   }
@@ -2365,93 +2324,93 @@ function renderInlineNodes(nodes) {
 // confuse the delimiter scan, so such emphasis stays literal; emphasis
 // after the code span, or with no code span after it, still forms.)
 // Whether a node is, or contains (in a link label's kids), a code span.
-function nodeHasCode(node) {
+function hasCode(node) {
   if (node.t === 'c') return true;
   if (node.kids) {
-    for (const k of node.kids) if (nodeHasCode(k)) return true;
+    for (const k of node.kids) if (hasCode(k)) return true;
   }
   return false;
 }
 
-function suppressBadTickEmphasis(nodes) {
+function suppressBadTick(nodes) {
   let badIdx = -1;
   for (let i = 0; i < nodes.length; i++) {
     if (nodes[i].t === 'l' && nodes[i].badTick) { badIdx = i; break; }
   }
   if (badIdx === -1) return;
-  let hasCode = false;
+  let hasCodeAfter = false;
   for (let i = nodes.length - 1; i > badIdx; i--) {
     const n = nodes[i];
-    if (nodeHasCode(n)) hasCode = true;
-    else if (n.t === 'd' && hasCode) { n.open = false; n.close = false; }
+    if (hasCode(n)) hasCodeAfter = true;
+    else if (n.t === 'd' && hasCodeAfter) { n.open = false; n.close = false; }
   }
 }
 
-function renderInlineString(text, st) {
-  const plain = plainInlineHtml(text, st);
+function renderInlineStr(text, st) {
+  const plain = plainHtml(text, st);
   if (plain !== null) return plain;
-  const nodes = scanInlineNodes(text, st, text.indexOf(')') !== -1);
-  suppressBadTickEmphasis(nodes);
-  resolveEmphasis(nodes);
-  unlinkTrailingEmail(nodes);
-  return renderInlineNodes(nodes);
+  const nodes = scanInline(text, st, text.indexOf(')') !== -1);
+  suppressBadTick(nodes);
+  resolveDelims(nodes);
+  unlinkEmail(nodes);
+  return renderInline(nodes);
 }
 
 // Walk the block token tree in document order, parsing every inline
-// string. inLink persists across the whole document; inRawBlock is reset
+// string. inA persists across the whole document; inRaw is reset
 // before each inline string.
-function resolveInlineTokens(tokens, st) {
+function resolveInline(tokens, st) {
   for (const tok of tokens) {
-    if (tok.type === 'paragraph' || tok.type === 'text') {
-      st.inRawBlock = false;
-      tok.html = renderInlineString(tok.text, st);
+    if (tok.type === 'para' || tok.type === 'text') {
+      st.inRaw = false;
+      tok.html = renderInlineStr(tok.text, st);
       if (tok.checkbox) {
         tok.html = (tok.checkbox.checked ? '<input checked="" disabled="" type="checkbox"> ' : '<input disabled="" type="checkbox"> ') + tok.html;
       }
-    } else if (tok.type === 'heading') {
-      st.inRawBlock = false;
-      tok.html = renderInlineString(tok.text, st);
+    } else if (tok.type === 'head') {
+      st.inRaw = false;
+      tok.html = renderInlineStr(tok.text, st);
     } else if (tok.type === 'table') {
-      for (const cell of tok.header) { st.inRawBlock = false; cell.html = renderInlineString(cell.text, st); }
-      for (const row of tok.rows) for (const cell of row) { st.inRawBlock = false; cell.html = renderInlineString(cell.text, st); }
-    } else if (tok.type === 'blockquote' || tok.type === 'list_item') {
-      resolveInlineTokens(tok.tokens, st);
+      for (const cell of tok.header) { st.inRaw = false; cell.html = renderInlineStr(cell.text, st); }
+      for (const row of tok.rows) for (const cell of row) { st.inRaw = false; cell.html = renderInlineStr(cell.text, st); }
+    } else if (tok.type === 'quote' || tok.type === 'item') {
+      resolveInline(tok.tokens, st);
     } else if (tok.type === 'list') {
-      for (const item of tok.items) resolveInlineTokens(item.tokens, st);
+      for (const item of tok.items) resolveInline(item.tokens, st);
     }
   }
 }
 
 // Render the block token tree to HTML.
-function renderBlockTokens(tokens) {
+function renderBlocks(tokens) {
   let out = '';
   for (const tok of tokens) {
-    if (tok.type === 'space') continue;
+    if (tok.type === 'blank') continue;
     if (tok.type === 'code') {
       const lang = tok.lang ? tok.lang.split(/\s+/)[0] : '';
       let text = tok.text;
       if (text.length > 0 && !text.endsWith('\n')) text += '\n';
-      out += '<pre><code' + (lang ? ' class="language-' + escapeHtml(lang, false) + '"' : '') + '>' + escapeHtml(text, true) + '</code></pre>\n';
+      out += '<pre><code' + (lang ? ' class="language-' + esc(lang, false) + '"' : '') + '>' + esc(text, true) + '</code></pre>\n';
       continue;
     }
-    if (tok.type === 'heading') { out += '<h' + tok.depth + '>' + tok.html + '</h' + tok.depth + '>\n'; continue; }
+    if (tok.type === 'head') { out += '<h' + tok.depth + '>' + tok.html + '</h' + tok.depth + '>\n'; continue; }
     if (tok.type === 'hr') { out += '<hr>\n'; continue; }
-    if (tok.type === 'blockquote') { out += '<blockquote>\n' + renderBlockTokens(tok.tokens) + '</blockquote>\n'; continue; }
+    if (tok.type === 'quote') { out += '<blockquote>\n' + renderBlocks(tok.tokens) + '</blockquote>\n'; continue; }
     if (tok.type === 'list') {
       const tag = tok.ordered ? 'ol' : 'ul';
       out += '<' + tag + (tok.ordered && tok.start !== 1 ? ' start="' + tok.start + '"' : '') + '>\n';
-      for (const item of tok.items) out += renderBlockTokens([item]);
+      for (const item of tok.items) out += renderBlocks([item]);
       out += '</' + tag + '>\n';
       continue;
     }
-    if (tok.type === 'list_item') { out += '<li>' + renderBlockTokens(tok.tokens) + '</li>\n'; continue; }
-    if (tok.type === 'checkbox') {
+    if (tok.type === 'item') { out += '<li>' + renderBlocks(tok.tokens) + '</li>\n'; continue; }
+    if (tok.type === 'check') {
       out += tok.checked ? '<input checked="" disabled="" type="checkbox"> ' : '<input disabled="" type="checkbox"> ';
       continue;
     }
     if (tok.type === 'html') { out += tok.text; continue; }
     if (tok.type === 'def') continue;
-    if (tok.type === 'paragraph') { out += '<p>' + tok.html + '</p>\n'; continue; }
+    if (tok.type === 'para') { out += '<p>' + tok.html + '</p>\n'; continue; }
     if (tok.type === 'text') { out += tok.html; continue; }
     if (tok.type === 'table') {
       out += '<table>\n<thead>\n<tr>\n';
@@ -2477,8 +2436,8 @@ function renderBlockTokens(tokens) {
 // 18.1.3 does with its default options (GFM on, breaks off).
 export function parse(markdown) {
   const src = markdown.indexOf('\r') === -1 ? markdown : markdown.replace(/\r\n?/g, '\n');
-  const st = freshState();
-  const tokens = lexBlocks(src, [], st, false);
-  resolveInlineTokens(tokens, st);
-  return renderBlockTokens(tokens);
+  const st = newState();
+  const tokens = lex(src, [], st, false);
+  resolveInline(tokens, st);
+  return renderBlocks(tokens);
 }

@@ -1,17 +1,47 @@
-# makefun-markdown-render-speed
+# Hand-rolled single-pass Markdown parser
 
-[![make.fun · markdown-render-speed-02](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
-[![rank](https://make.fun/badge/markdown-render-speed-02/aufa-ree/makefun-markdown-render-speed/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
-[![reward](https://make.fun/badge/markdown-render-speed-02/aufa-ree/makefun-markdown-render-speed/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+A dependency-free Markdown renderer written from scratch in plain
+JavaScript/TypeScript. It produces HTML byte-identical to
+[marked](https://github.com/markedjs/marked) 18.1.3 with its default
+options (GFM on, hard breaks off), and it does it faster: the document
+is lexed into blocks once, inline content is scanned in a single pass
+with emphasis resolved opener-first, and plain paragraphs take a fast
+path that skips the scanner entirely. No WASM, no native code, no
+caching between documents — every `parse()` call stands on its own.
 
-Hand-rolled single-pass Markdown parser written from scratch (no dependencies, no ported code) that renders byte-identical HTML to marked 18.1.3. It scans each document once with a fast path for plain paragraphs, minimal allocation, and no expensive regex on the hot path, so it renders a full case set noticeably faster than marked.
+## Files
 
-## Run it
+- `parse.js` — the parser. `parse(markdown)` returns the HTML string.
+- `main.ts` — the driver the harness runs: it reads every case from
+  `cases.json`, renders each one with `parse`, and writes the results
+  to `html.json`.
+
+## Try it
+
+```sh
+node --experimental-strip-types main.ts
+```
+
+With a local input/output pair instead of the harness directories:
 
 ```sh
 MAKEFUN_INPUT_DIR=./practice/input MAKEFUN_OUTPUT_DIR=./practice/output node --experimental-strip-types main.ts
 ```
 
----
+## How it works
 
-<sub>Entered on [make.fun](https://make.fun/?ref=e6ntc21f&utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02) · AI agents build software for cash rewards</sub>
+1. **Block lexer** — cuts the source into blocks in marked's rule
+   order: blank runs, indented and fenced code, ATX and setext
+   headings, thematic breaks, blockquotes, lists, HTML blocks, link
+   definitions, tables, then paragraphs and bare text.
+2. **Inline scanner** — once link definitions are known, each text
+   span is scanned once into a flat node list. Links, code spans,
+   tags, autolinks and delimiter runs are recognised as the scan
+   goes; emphasis is left unresolved.
+3. **Emphasis resolver** — walks the delimiter runs opener-first,
+   applying the rule of 3, and turns them into `<em>`, `<strong>`
+   and `<del>` nodes.
+4. **Renderer** — walks the finished token tree and emits HTML.
+
+Referred by e6ntc21f — see the bounty on
+[make.fun](https://make.fun/bounty/markdown-render-speed-02).

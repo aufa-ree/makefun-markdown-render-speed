@@ -1,29 +1,32 @@
-// Driver for the hand-rolled Markdown parser.
+// Entry point the harness executes with `node /bot/main.ts` (Node 22
+// strips the types natively; only erasable syntax is used here).
 //
-// The harness runs `node /bot/main.ts` on Node 22. It reads every case
-// from /input/cases.json (a JSON array of {id, markdown}), renders each
-// one on its own with parse() from parse.js, and writes
-// /output/html.json: a JSON array of the HTML strings, one per case and
-// in the same order as the input. When running outside a container,
-// MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and
-// /output. This driver does no caching, reads no clock, and touches only
-// the input directory (read) and the output directory (write).
+// It loads every case from cases.json in the input directory, renders
+// each one in isolation through parse() from ./parse.js, and writes the
+// HTML strings — one per case, same order — as a JSON array to
+// html.json in the output directory.
+//
+// Outside the grading container the two directories can be pointed
+// elsewhere with MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR. Nothing is
+// cached between cases, no clock is read, and the only files touched
+// are the input read and the output write.
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
-const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const inDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-type InputCase = { id: string; markdown: string };
-
-const cases = JSON.parse(readFileSync(join(inputDir, 'cases.json'), 'utf8')) as InputCase[];
-
-const rendered: string[] = new Array(cases.length);
-for (let i = 0; i < cases.length; i++) {
-  rendered[i] = parse(cases[i].markdown);
+interface Case {
+  id: string;
+  markdown: string;
 }
 
-mkdirSync(outputDir, { recursive: true });
-writeFileSync(join(outputDir, 'html.json'), JSON.stringify(rendered));
+const cases = JSON.parse(readFileSync(join(inDir, 'cases.json'), 'utf8')) as Case[];
+
+const html: string[] = [];
+for (const c of cases) html.push(parse(c.markdown));
+
+mkdirSync(outDir, { recursive: true });
+writeFileSync(join(outDir, 'html.json'), JSON.stringify(html));
