@@ -20,24 +20,14 @@ const RAW_TAGS = new Set(['pre', 'code', 'kbd', 'script']);
 
 // ---------- small helpers ----------
 
+// Escape < > " ' and (when encodeAmp) & . When encodeAmp is false, an &
+// that starts something looking like an entity reference is left alone
+// (&#x hex; / &# digits; / &word; — see isEntityLike).
+const ESC_AMP_RE = /[<>"'&]/g;
+const ESC_NOAMP_RE = /[<>"']|&(?!(?:#x[0-9a-fA-F]{1,6};|#\d{1,7};|\w+;))/g;
 function escHtml(s, encodeAmp) {
-  // Escape < > " ' and (when encodeAmp) & . When encodeAmp is false, an &
-  // that starts something looking like an entity reference is left alone.
-  let out = '', start = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    let rep = null;
-    if (c === '<') rep = '&lt;';
-    else if (c === '>') rep = '&gt;';
-    else if (c === '"') rep = '&quot;';
-    else if (c === "'") rep = '&#39;';
-    else if (c === '&') {
-      if (encodeAmp) rep = '&amp;';
-      else if (!isEntityLike(s, i)) rep = '&amp;';
-    }
-    if (rep !== null) { out += s.slice(start, i) + rep; start = i + 1; }
-  }
-  return start === 0 ? s : out + s.slice(start);
+  const re = encodeAmp ? ESC_AMP_RE : ESC_NOAMP_RE;
+  return s.replace(re, (c) => c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : c === "'" ? '&#39;' : '&amp;');
 }
 
 function isEntityLike(s, i) {
