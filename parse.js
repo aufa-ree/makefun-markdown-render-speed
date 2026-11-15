@@ -818,13 +818,33 @@ function readQuote(s, st) {
 }
 
 // Match a list item at the start of `s`: `^( {0,3}BULLET)((?:[ \t][^\n]*)?(?:\n|$))`
-// `bulletRe` is the regex source for the bullet (e.g. `\-` or `\d{1,9}\.`).
-function matchListItem(s, bulletRe) {
+// `marker` describes the bullet to accept: null for any bullet, {term}
+// for an ordered bullet ending in '.' or ')', {ch} for one unordered
+// bullet character.
+function matchListItem(s, marker) {
   let p = 0, sp = 0;
   while (sp < 3 && s[p] === ' ') { p++; sp++; }
-  const m = new RegExp('^' + bulletRe).exec(s.slice(p));
-  if (!m) return null;
-  const bulletEnd = p + m[0].length;
+  let mlen = 0;
+  if (marker === null) {
+    const c = s[p];
+    if (c === '*' || c === '+' || c === '-') mlen = 1;
+    else if (c >= '0' && c <= '9') {
+      let q = p;
+      while (q < s.length && s[q] >= '0' && s[q] <= '9') q++;
+      if (q - p <= 9 && (s[q] === '.' || s[q] === ')')) mlen = q + 1 - p;
+    }
+  } else if (marker.term) {
+    const c = s[p];
+    if (c >= '0' && c <= '9') {
+      let q = p;
+      while (q < s.length && s[q] >= '0' && s[q] <= '9') q++;
+      if (q - p <= 9 && s[q] === marker.term) mlen = q + 1 - p;
+    }
+  } else if (s[p] === marker.ch) {
+    mlen = 1;
+  }
+  if (mlen === 0) return null;
+  const bulletEnd = p + mlen;
   // The marker must be followed by a space, tab, newline or end of input.
   const after = s[bulletEnd];
   if (after !== ' ' && after !== '\t' && after !== '\n' && after !== undefined) return null;
@@ -865,6 +885,43 @@ function firstNonSpace(s) {
   return -1;
 }
 
+// First line of s (up to the first '\n', or the whole string).
+function firstLineOf(s) {
+  return s.slice(0, endOfLine(s, 0));
+}
+
+// Expand the leading whitespace run of a line to spaces (tabs to the next
+// multiple of 4 from `col`); a run without tabs is returned unchanged.
+function expandLeadingWS(line, col) {
+  let r = 0, hasTab = false;
+  while (r < line.length && (line[r] === ' ' || line[r] === '\t')) { if (line[r] === '\t') hasTab = true; r++; }
+  if (!hasTab) return line;
+  return expandTabStops(line.slice(0, r), col) + line.slice(r);
+}
+
+// Index of the first non-space character with each tab counted as 4
+// spaces; -1 when the string is all spaces and tabs.
+function firstNonSpaceTab4(s) {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === ' ') n++;
+    else if (c === '\t') n += 4;
+    else return n;
+  }
+  return -1;
+}
+
+// Does s end with a blank line (newline, spaces/tabs, newline, spaces/tabs)?
+function endsWithBlankLine(s) {
+  let i = s.length;
+  while (i > 0 && (s[i - 1] === ' ' || s[i - 1] === '\t')) i--;
+  if (i === 0 || s[i - 1] !== '\n') return false;
+  i--;
+  while (i > 0 && (s[i - 1] === ' ' || s[i - 1] === '\t')) i--;
+  return i > 0 && s[i - 1] === '\n';
+}
+
 // Does `text` (one or two lines joined by \n) form a setext heading?
 function isSetextHeading(text) {
   const nl = text.indexOf('\n');
@@ -876,24 +933,24 @@ function isSetextHeading(text) {
 }
 
 function readList(s, st) {
-  const first = matchListItem(s, '(?:[*+-]|\\d{1,9}[.)])');
+  const first = matchListItem(s, null);
   if (!first) return null;
   const bulletText = s.slice(0, first.bulletLen).trim();
   const ordered = bulletText.length > 1;
-  const bulletRe = ordered ? '\\d{1,9}\\' + bulletText.slice(-1) : '\\' + bulletText;
+  const marker = ordered ? { term: bulletText.slice(-1) } : { ch: bulletText };
   const items = [];
   let loose = false, pFlag = false;
   let e = s, consumed = 0;
   while (e.length > 0) {
-    const t = matchListItem(e, bulletRe);
+    const t = matchListItem(e, marker);
     if (!t || lineIsRule(e, 0)) break;
     const k = consumed;
     e = e.substring(t.totalLen);
     consumed += t.totalLen;
-    const g = t.rest.split('\n', 1)[0];
+    const g = firstLineOf(t.rest);
     const b = t.bulletLen;
-    const m = g.replace(/^[ \t]+/, (v) => expandTabStops(v, b));
-    const f = e.split('\n', 1)[0];
+    const m = expandLeadingWS(g, b);
+    const f = firstLineOf(e);
     const y = !m.trim();
     let R, d;
     if (y) { R = b + 1; d = ''; }
@@ -909,16 +966,16 @@ function readList(s, st) {
       let mm = m;
       let yy = y;
       while (e.length > 0) {
-        const U = e.split('\n', 1)[0];
+        const U = firstLineOf(e);
         const f2 = U;
-        const Z = f2.replace(/^[ \t]+/, (v) => expandTabStops(v, 0));
+        const Z = expandLeadingWS(f2, 0);
         const cl = Math.max(0, Math.min(3, R - 1));
         if (fenceStartLine(f2, cl) || headingBeginLine(f2, cl) || htmlStartsAt(f2, 0, cl, 'line') ||
             blockquoteBeginLine(f2, cl) || nextBulletAt(f2, 0, cl) || hrLineAt(f2, cl)) break;
         if (firstNonSpace(Z) >= R || !f2.trim()) {
           d += '\n' + Z.slice(R);
         } else {
-          if (yy || firstNonSpace(mm.replace(/\t/g, '    ')) >= 4 ||
+          if (yy || firstNonSpaceTab4(mm) >= 4 ||
               fenceStartLine(mm, 0) || headingBeginLine(mm, 0) || htmlStartsAt(mm, 0, 0, 'line') || hrLineAt(mm, 0)) break;
           let qe = f2;
           if (/^ {0,3}(?:=+|-+) *$/.test(f2) && isSetextHeading(mm + '\n' + f2)) {
@@ -935,7 +992,7 @@ function readList(s, st) {
     const A = s.slice(k, consumed);
     if (!loose) {
       if (pFlag) loose = true;
-      else if (/\n[ \t]*\n[ \t]*$/.test(A)) pFlag = true;
+      else if (endsWithBlankLine(A)) pFlag = true;
     }
     items.push({ type: 'list_item', raw: A, task: false, loose: false, text: d, tokens: [] });
   }
@@ -1730,7 +1787,9 @@ function startsWithCI(src, j, prefix) {
 // / start; mailto:/xmpp: need a non-alphanumeric before them; a bare
 // email's local part must start here (the preceding char must not be an
 // email character). extendedAutolinkAt does the real validation.
-function extendedUrlStartsHere(src, j) {
+// `mayEmail` is false when the scanned string holds no '@' at all, which
+// rules out the bare-email branch without a regex test per word.
+function extendedUrlStartsHere(src, j, mayEmail) {
   const c = src[j];
   const prev = j === 0 ? '' : src[j - 1];
   if ((c === 'h' || c === 'H') && (startsWithCI(src, j, 'http://') || startsWithCI(src, j, 'https://'))) {
@@ -1749,7 +1808,7 @@ function extendedUrlStartsHere(src, j) {
   }
   // Otherwise the character may start a bare email's local part.
   // (A sticky native regex replaces the per-char JS loop here.)
-  if (isEmailLocalCh(c) && (j === 0 || !isEmailLocalCh(prev))) {
+  if (mayEmail && isEmailLocalCh(c) && (j === 0 || !isEmailLocalCh(prev))) {
     EMAIL_START_RE.lastIndex = j;
     if (EMAIL_START_RE.test(src)) return extendedAutolinkAt(src, j, prev) !== null;
   }
@@ -1758,7 +1817,7 @@ function extendedUrlStartsHere(src, j) {
 
 // End of the plain-text run starting at src[i]: the first position where a
 // non-text construct may start. Inside a raw span only `\` and `<` count.
-function textRunStop(src, i, st) {
+function textRunStop(src, i, st, mayEmail) {
   const n = src.length;
   let j = i;
   if (st.inRawBlock) {
@@ -1780,7 +1839,9 @@ function textRunStop(src, i, st) {
       while (src[k] === ' ') k++;
       if (k - j >= 2 && src[k] === '\n' && hasNonWS(src, k + 1)) break;
     }
-    if (noLink && extendedUrlStartsHere(src, j)) break;
+    if (noLink && (c === 'h' || c === 'H' || c === 'f' || c === 'F' || c === 'w' || c === 'm' || c === 'x' ||
+        (mayEmail && isEmailLocalCh(c) && (j === 0 || !isEmailLocalCh(src[j - 1])))) &&
+        extendedUrlStartsHere(src, j, mayEmail)) break;
     j++;
   }
   return j;
@@ -1879,12 +1940,29 @@ function attemptLink(src, i, st, linkParenPossible) {
   };
 }
 
+// Fast path for inline strings with no inline constructs at all: no
+// backslash, tag, code span, link bracket, delimiter run, image start,
+// two-space hard break, or anything that could linkify (www., a scheme
+// URL, mailto:/xmpp:, or a word with '@' in it). Such text renders as
+// plain escaped text — or verbatim inside a raw span — without the
+// scanner. The guards are supersets of the real constructs, so a false
+// positive only costs speed, never correctness.
+const FAST_PLAIN = /[\\<`\[*_~]|!\[|  +\n|www\.|https?:\/\/|ftp:\/\/|mailto:|xmpp:|\S+@\S/i;
+function plainInlineHtml(text, st) {
+  if (FAST_PLAIN.test(text)) return null;
+  if (st.inRawBlock) return text;
+  return /[&<>"']/.test(text) ? escapeHtml(decodeNumericEntities(text), false) : text;
+}
+
 // Phase A: scan inline content into a flat node list (delimiter runs left
 // unresolved for resolveEmphasis). `st` carries inLink / inRawBlock.
 function scanInlineNodes(src, st, linkParenPossible) {
+  const plain = plainInlineHtml(src, st);
+  if (plain !== null) return [{ t: 'x', s: plain }];
   const nodes = [];
   const n = src.length;
   let i = 0;
+  const mayEmail = src.indexOf('@') !== -1; // no '@' anywhere: no bare email can start
   let suppressUntil = -1; // end of a failed-link label: emphasis delimiters
   // inside it are literal text (marked swallows the label into a text
   // token when its label regex fails), though code spans still resolve.
@@ -1969,7 +2047,7 @@ function scanInlineNodes(src, st, linkParenPossible) {
       continue;
     }
     if (st.inRawBlock) {
-      const j = textRunStop(src, i, st);
+      const j = textRunStop(src, i, st, mayEmail);
       pushRaw(src.slice(i, j));
       i = j;
       continue;
@@ -2049,7 +2127,7 @@ function scanInlineNodes(src, st, linkParenPossible) {
       continue;
     }
     // GFM extended autolink (www. / http(s):// / ftp:// / email)
-    if (!st.inLink && extendedUrlStartsHere(src, i)) {
+    if (!st.inLink && extendedUrlStartsHere(src, i, mayEmail)) {
       const u = extendedAutolinkAt(src, i, src[i - 1]);
       if (u) {
         const href = normalizeHref(u.href);
@@ -2063,7 +2141,7 @@ function scanInlineNodes(src, st, linkParenPossible) {
       }
     }
     // plain text run
-    const j = textRunStop(src, i, st);
+    const j = textRunStop(src, i, st, mayEmail);
     if (j === i) { pushRaw(src[i]); i++; continue; } // safety: never stall
     pushRaw(src.slice(i, j));
     i = j;
@@ -2310,6 +2388,8 @@ function suppressBadTickEmphasis(nodes) {
 }
 
 function renderInlineString(text, st) {
+  const plain = plainInlineHtml(text, st);
+  if (plain !== null) return plain;
   const nodes = scanInlineNodes(text, st, text.indexOf(')') !== -1);
   suppressBadTickEmphasis(nodes);
   resolveEmphasis(nodes);
