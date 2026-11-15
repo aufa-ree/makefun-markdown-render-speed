@@ -1391,6 +1391,7 @@ function blockTokens(src, tokens, st, cont) {
 // ============================ INLINE PARSER ============================
 
 const PUNCT_RE = /[\p{P}\p{S}]/u;
+const EMAIL_START_RE = /[A-Za-z0-9._+-]+@/y;
 const ALNUM_RE = /[\p{L}\p{N}]/u;
 function isPunctCh(c) { return c !== '' && PUNCT_RE.test(c); }
 function isWS(c) {
@@ -1754,10 +1755,10 @@ function urlStartAt(src, j) {
     return matchExtendedUrl(src, j, prev) !== null;
   }
   // Otherwise the character may start a bare email's local part.
+  // (A sticky native regex replaces the per-char JS loop here.)
   if (isEmailLocalCh(c) && (j === 0 || !isEmailLocalCh(prev))) {
-    let k = j;
-    while (k < src.length && k < j + 65 && isEmailLocalCh(src[k])) k++;
-    if (src[k] === '@') return matchExtendedUrl(src, j, prev) !== null;
+    EMAIL_START_RE.lastIndex = j;
+    if (EMAIL_START_RE.test(src)) return matchExtendedUrl(src, j, prev) !== null;
   }
   return false;
 }
@@ -1767,19 +1768,26 @@ function urlStartAt(src, j) {
 function textRunEnd(src, i, st) {
   const n = src.length;
   let j = i;
+  if (st.inRawBlock) {
+    while (j < n) {
+      const c = src[j];
+      if (c === '\\' || c === '<') break;
+      j++;
+    }
+    return j;
+  }
+  const noLink = !st.inLink;
   while (j < n) {
     const c = src[j];
     if (c === '\\' || c === '<') break;
-    if (!st.inRawBlock) {
-      if (c === '[' || c === '`' || c === '*' || c === '_' || c === '~') break;
-      if (c === '!' && src[j + 1] === '[') break;
-      if (c === ' ' && src[j - 1] !== ' ') {
-        let k = j;
-        while (src[k] === ' ') k++;
-        if (k - j >= 2 && src[k] === '\n' && hasNonWS(src, k + 1)) break;
-      }
-      if (!st.inRawBlock && !st.inLink && urlStartAt(src, j)) break;
+    if (c === '[' || c === '`' || c === '*' || c === '_' || c === '~') break;
+    if (c === '!' && src[j + 1] === '[') break;
+    if (c === ' ' && src[j - 1] !== ' ') {
+      let k = j;
+      while (src[k] === ' ') k++;
+      if (k - j >= 2 && src[k] === '\n' && hasNonWS(src, k + 1)) break;
     }
+    if (noLink && urlStartAt(src, j)) break;
     j++;
   }
   return j;
@@ -2396,7 +2404,7 @@ function renderTokens(tokens) {
 // Entry point: render a Markdown document to HTML, exactly as marked
 // 18.1.3 does with its default options (GFM on, breaks off).
 export function parse(markdown) {
-  const src = markdown.replace(/\r\n?/g, '\n');
+  const src = markdown.indexOf('\r') === -1 ? markdown : markdown.replace(/\r\n?/g, '\n');
   const st = newState();
   const tokens = blockTokens(src, [], st, false);
   parseInlineTokens(tokens, st);
